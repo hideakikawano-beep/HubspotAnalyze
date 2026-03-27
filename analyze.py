@@ -191,17 +191,25 @@ def _get_associations_v4(client, deal_id, to_object_type):
 def fetch_associated_companies(client, deal_ids):
     """取引に関連する会社を一括取得"""
     deal_companies = {}
+    total = len(deal_ids)
+    company_cache = {}
 
-    for deal_id in deal_ids:
+    for i, deal_id in enumerate(deal_ids):
+        if (i + 1) % 20 == 0 or i + 1 == total:
+            print(f"  関連会社: {i + 1}/{total}件処理中...", flush=True)
         company_ids = _get_associations_v4(client, deal_id, "companies")
         if company_ids:
             companies = []
             for cid in company_ids:
+                if cid in company_cache:
+                    companies.append(company_cache[cid])
+                    continue
                 try:
                     company = client.crm.companies.basic_api.get_by_id(
                         company_id=cid, properties=COMPANY_PROPERTIES
                     )
                     companies.append(company)
+                    company_cache[cid] = company
                 except Exception:
                     pass
             if companies:
@@ -215,16 +223,19 @@ def fetch_deal_activities(client, deal_ids):
     """取引に関連するアクティビティ数を取得"""
     deal_activities = {}
     activity_object_types = ["notes", "emails", "calls", "meetings", "tasks"]
+    total = len(deal_ids)
 
-    for deal_id in deal_ids:
+    for i, deal_id in enumerate(deal_ids):
+        if (i + 1) % 20 == 0 or i + 1 == total:
+            print(f"  アクティビティ: {i + 1}/{total}件処理中...", flush=True)
         counts = {}
         for obj_type in activity_object_types:
             ids = _get_associations_v4(client, deal_id, obj_type)
             counts[obj_type] = len(ids)
         deal_activities[deal_id] = counts
 
-    total = sum(sum(c.values()) for c in deal_activities.values())
-    print(f"アクティビティ: 合計{total}件を取得")
+    total_acts = sum(sum(c.values()) for c in deal_activities.values())
+    print(f"アクティビティ: 合計{total_acts}件を取得")
     return deal_activities
 
 

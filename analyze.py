@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -41,6 +42,29 @@ ACTIVITY_TYPES = {
     "tasks": "タスク",
 }
 
+# 会社名→業界のマッピング（リサーチ結果）
+COMPANY_INDUSTRY_MAP = {}
+
+
+def extract_company_from_dealname(dealname):
+    """取引名から会社名を抽出する（例: '会社名_プラン_詳細' → '会社名'）"""
+    if not dealname:
+        return "不明"
+    # 先頭の会社名部分を抽出（_, -, スペース で区切られた最初の部分）
+    name = re.split(r'[_\-–—]', dealname)[0].strip()
+    # 「株式会社」等を含む場合は次のパートも含める
+    if not name:
+        return "不明"
+    return name
+
+
+def get_industry_for_company(company_name):
+    """会社名から業界を取得（マッピングから検索）"""
+    for key, industry in COMPANY_INDUSTRY_MAP.items():
+        if key.lower() in company_name.lower() or company_name.lower() in key.lower():
+            return industry
+    return "不明"
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HubSpot 営業実績分析ツール")
@@ -58,6 +82,11 @@ def parse_args():
         "--output",
         default=None,
         help="出力ファイルパス (デフォルト: reports/sales_report_YYYYMMDD.md)",
+    )
+    parser.add_argument(
+        "--list-companies",
+        action="store_true",
+        help="取引名から会社名を抽出してリスト表示",
     )
     return parser.parse_args()
 
@@ -361,10 +390,21 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
             pass
 
         companies = deal_companies.get(deal_id, [])
-        for company in companies:
-            industry = (company.properties.get("industry") or "不明").strip()
-            if not industry:
-                industry = "不明"
+        if companies:
+            for company in companies:
+                industry = (company.properties.get("industry") or "不明").strip()
+                if not industry:
+                    industry = "不明"
+                results["industries"][industry]["total"] += 1
+                results["industries"][industry]["amount"] += amount
+                if status == "won":
+                    results["industries"][industry]["won"] += 1
+                elif status == "lost":
+                    results["industries"][industry]["lost"] += 1
+        else:
+            # フォールバック: 取引名から会社名を抽出して業界を推定
+            company_name = extract_company_from_dealname(props.get("dealname", ""))
+            industry = get_industry_for_company(company_name)
             results["industries"][industry]["total"] += 1
             results["industries"][industry]["amount"] += amount
             if status == "won":
@@ -678,10 +718,28 @@ def main():
         print("取引が見つかりませんでした。")
         sys.exit(0)
 
+    # --list-companies モード: 取引名から会社名を抽出して一覧表示
+    if args.list_companies:
+        companies = set()
+        for deal in deals:
+            name = extract_company_from_dealname(deal.properties.get("dealname", ""))
+            if name and name != "不明":
+                companies.add(name)
+        print(f"\n=== 取引名から抽出した会社名一覧 ({len(companies)}社) ===")
+        for c in sorted(companies):
+            industry = get_industry_for_company(c)
+            mark = "" if industry != "不明" else " [要リサーチ]"
+            print(f"  {c}{mark}")
+        sys.exit(0)
+
     deal_ids = [d.id for d in deals]
 
     print("関連会社データを取得中...")
     deal_companies = fetch_associated_companies(client, deal_ids)
+
+    # 会社データが取れなかった場合、取引名から会社名を抽出してフォールバック
+    if not deal_companies:
+        print("  → 関連会社が0件のため、取引名から会社名を抽出します...")
 
     print("アクティビティデータを取得中...")
     deal_activities = fetch_deal_activities(client, deal_ids)

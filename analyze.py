@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HubSpot 営業実績分析ツール - Hideaki Kawano向け営業データ分析スクリプト"""
+"""HubSpot 営業実績分析ツール - Hideaki Kawano向け"""
 
 import argparse
 import os
@@ -10,14 +10,13 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from hubspot import HubSpot
 from hubspot.crm.deals import (
+    PublicObjectSearchRequest,
     Filter,
     FilterGroup,
-    PublicObjectSearchRequest,
 )
 
 load_dotenv()
 
-# --- 定数 ---
 DEAL_PROPERTIES = [
     "dealname",
     "amount",
@@ -29,844 +28,661 @@ DEAL_PROPERTIES = [
     "closed_lost_reason",
     "closed_won_reason",
     "hubspot_owner_id",
-    "hs_analytics_source",
+    "hs_deal_stage_probability",
 ]
 
-COMPANY_PROPERTIES = [
-    "name",
-    "industry",
-    "type",
-    "domain",
-]
+COMPANY_PROPERTIES = ["name", "industry", "type", "domain"]
 
-ASSOCIATION_TYPES = {
-    "notes": "notes",
-    "emails": "emails",
-    "calls": "calls",
-    "meetings": "meetings",
-    "tasks": "tasks",
+ACTIVITY_TYPES = {
+    "notes": "ノート",
+    "emails": "メール",
+    "calls": "電話",
+    "meetings": "ミーティング",
+    "tasks": "タスク",
 }
 
 
-# --- 期間パース ---
-def parse_period(period_str: str) -> tuple[datetime | None, datetime | None]:
-    """期間文字列をパースして(start, end)のdatetimeタプルを返す"""
+def parse_args():
+    parser = argparse.ArgumentParser(description="HubSpot 営業実績分析ツール")
+    parser.add_argument(
+        "--period",
+        default="all",
+        help="分析期間: all, 1y, 6m, quarter, or YYYY-MM-DD:YYYY-MM-DD",
+    )
+    parser.add_argument(
+        "--owner",
+        default="Hideaki Kawano",
+        help="対象オーナー名 (部分一致)",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="出力ファイルパス (デフォルト: reports/sales_report_YYYYMMDD.md)",
+    )
+    return parser.parse_args()
+
+
+def get_date_range(period_str):
+    """期間文字列からstart_date, end_dateを返す"""
     now = datetime.now()
+    end_date = now
 
     if period_str == "all":
         return None, None
     elif period_str == "1y":
-        return now - timedelta(days=365), now
+        start_date = now - timedelta(days=365)
     elif period_str == "6m":
-        return now - timedelta(days=182), now
+        start_date = now - timedelta(days=182)
     elif period_str == "quarter":
-        # 現在の四半期の開始日
         quarter_month = ((now.month - 1) // 3) * 3 + 1
-        start = datetime(now.year, quarter_month, 1)
-        return start, now
+        start_date = now.replace(month=quarter_month, day=1, hour=0, minute=0, second=0, microsecond=0)
     elif ":" in period_str:
         parts = period_str.split(":")
-        start = datetime.strptime(parts[0], "%Y-%m-%d")
-        end = datetime.strptime(parts[1], "%Y-%m-%d")
-        return start, end
+        start_date = datetime.strptime(parts[0], "%Y-%m-%d")
+        end_date = datetime.strptime(parts[1], "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59
+        )
     else:
-        print(f"不正な期間指定: {period_str}")
-        print("有効な値: all, 1y, 6m, quarter, YYYY-MM-DD:YYYY-MM-DD")
+        print(f"不明な期間指定: {period_str}")
         sys.exit(1)
 
+    return start_date, end_date
 
-# --- HubSpot API クライアント ---
-class HubSpotAnalyzer:
-    def __init__(self, api_key: str):
-        self.client = HubSpot(access_token=api_key)
-        self._pipeline_stages = {}
 
-    def find_owner(self, owner_name: str) -> str | None:
-        """オーナー名からIDを検索（部分一致）"""
-        owners = self.client.crm.owners.get_page()
-        for owner in owners.results:
-            full_name = f"{owner.first_name} {owner.last_name}".strip()
-            if owner_name.lower() in full_name.lower():
-                print(f"  オーナー検出: {full_name} (ID: {owner.id})")
-                return owner.id
-        return None
+def find_owner(client, owner_name):
+    """オーナー名で検索してowner_idを返す"""
+    owners_list = client.crm.owners.get_all()
+    for owner in owners_list:
+        full_name = f"{owner.first_name or ''} {owner.last_name or ''}".strip()
+        email = owner.email or ""
+        if (
+            owner_name.lower() in full_name.lower()
+            or owner_name.lower() in email.lower()
+        ):
+            print(f"オーナー検出: {full_name} (ID: {owner.id}, Email: {email})")
+            return owner.id, full_name
+    print(f"オーナー '{owner_name}' が見つかりません。")
+    print("利用可能なオーナー:")
+    for owner in owners_list:
+        full_name = f"{owner.first_name or ''} {owner.last_name or ''}".strip()
+        print(f"  - {full_name} ({owner.email})")
+    sys.exit(1)
 
-    def get_pipeline_stages(self) -> dict[str, str]:
-        """パイプラインのステージIDと名前のマッピングを取得"""
-        if self._pipeline_stages:
-            return self._pipeline_stages
 
-        pipelines = self.client.crm.pipelines.get_all("deals")
-        for pipeline in pipelines.results:
-            for stage in pipeline.stages:
-                self._pipeline_stages[stage.id] = stage.label
-        return self._pipeline_stages
+def fetch_deals(client, owner_id, start_date, end_date):
+    """取引を検索して取得"""
+    filters = [
+        Filter(property_name="hubspot_owner_id", operator="EQ", value=owner_id)
+    ]
 
-    def get_deals(
-        self,
-        owner_id: str,
-        start_date: datetime | None,
-        end_date: datetime | None,
-    ) -> list[dict]:
-        """オーナーと期間でフィルタした取引を取得"""
-        filters = [
+    if start_date:
+        filters.append(
             Filter(
-                property_name="hubspot_owner_id",
-                operator="EQ",
-                value=owner_id,
+                property_name="createdate",
+                operator="GTE",
+                value=str(int(start_date.timestamp() * 1000)),
             )
-        ]
-
-        if start_date:
-            filters.append(
-                Filter(
-                    property_name="createdate",
-                    operator="GTE",
-                    value=str(int(start_date.timestamp() * 1000)),
-                )
+        )
+    if end_date:
+        filters.append(
+            Filter(
+                property_name="createdate",
+                operator="LTE",
+                value=str(int(end_date.timestamp() * 1000)),
             )
-        if end_date:
-            filters.append(
-                Filter(
-                    property_name="createdate",
-                    operator="LTE",
-                    value=str(int(end_date.timestamp() * 1000)),
-                )
-            )
-
-        filter_group = FilterGroup(filters=filters)
-        search_request = PublicObjectSearchRequest(
-            filter_groups=[filter_group],
-            properties=DEAL_PROPERTIES,
-            limit=100,
         )
 
-        all_deals = []
-        after = None
+    all_deals = []
+    after = None
 
-        while True:
-            if after:
-                search_request.after = after
+    while True:
+        search_request = PublicObjectSearchRequest(
+            filter_groups=[FilterGroup(filters=filters)],
+            properties=DEAL_PROPERTIES,
+            limit=100,
+            after=after or "0",
+        )
+        response = client.crm.deals.search_api.do_search(
+            public_object_search_request=search_request
+        )
+        all_deals.extend(response.results)
+        if response.paging and response.paging.next:
+            after = response.paging.next.after
+        else:
+            break
 
-            response = self.client.crm.deals.search_api.do_search(
-                public_object_search_request=search_request,
-            )
+    print(f"取引数: {len(all_deals)}件を取得")
+    return all_deals
 
-            for deal in response.results:
-                all_deals.append(
-                    {
-                        "id": deal.id,
-                        "name": deal.properties.get("dealname", ""),
-                        "amount": _parse_float(deal.properties.get("amount")),
-                        "stage": deal.properties.get("dealstage", ""),
-                        "pipeline": deal.properties.get("pipeline", ""),
-                        "createdate": _parse_date(
-                            deal.properties.get("createdate")
-                        ),
-                        "closedate": _parse_date(
-                            deal.properties.get("closedate")
-                        ),
-                        "closed_won_date": _parse_date(
-                            deal.properties.get("hs_closed_won_date")
-                        ),
-                        "closed_lost_reason": deal.properties.get(
-                            "closed_lost_reason", ""
-                        ),
-                        "closed_won_reason": deal.properties.get(
-                            "closed_won_reason", ""
-                        ),
-                        "source": deal.properties.get(
-                            "hs_analytics_source", ""
-                        ),
-                    }
-                )
 
-            if response.paging and response.paging.next:
-                after = response.paging.next.after
-            else:
-                break
+def fetch_pipeline_stages(client):
+    """パイプラインとステージのマッピングを取得"""
+    pipelines = client.crm.pipelines.pipelines_api.get_all(object_type="deals")
+    stage_map = {}
+    pipeline_map = {}
+    for pipeline in pipelines.results:
+        pipeline_map[pipeline.id] = pipeline.label
+        for stage in pipeline.stages:
+            stage_map[stage.id] = {
+                "label": stage.label,
+                "pipeline": pipeline.label,
+                "display_order": stage.display_order,
+                "metadata": stage.metadata,
+            }
+    return stage_map, pipeline_map
 
-        print(f"  取引数: {len(all_deals)}件取得")
-        return all_deals
 
-    def get_deal_companies(self, deal_id: str) -> list[dict]:
-        """取引に紐づく会社情報を取得"""
+def fetch_associated_companies(client, deal_ids):
+    """取引に関連する会社を一括取得"""
+    deal_companies = {}
+
+    for deal_id in deal_ids:
         try:
-            associations = (
-                self.client.crm.deals.associations_api.get_all(
-                    deal_id=deal_id,
-                    to_object_type="companies",
-                )
+            associations = client.crm.deals.associations_api.get_all(
+                deal_id=deal_id,
+                to_object_type="companies",
             )
-            companies = []
-            for assoc in associations.results:
-                company = self.client.crm.companies.basic_api.get_by_id(
-                    company_id=assoc.to_object_id,
-                    properties=COMPANY_PROPERTIES,
-                )
-                companies.append(
-                    {
-                        "name": company.properties.get("name", ""),
-                        "industry": company.properties.get("industry", ""),
-                        "type": company.properties.get("type", ""),
-                    }
-                )
-            return companies
+            company_ids = [a.id for a in associations.results] if associations.results else []
+            if company_ids:
+                companies = []
+                for cid in company_ids:
+                    try:
+                        company = client.crm.companies.basic_api.get_by_id(
+                            company_id=cid, properties=COMPANY_PROPERTIES
+                        )
+                        companies.append(company)
+                    except Exception:
+                        pass
+                deal_companies[deal_id] = companies
         except Exception:
-            return []
+            pass
 
-    def get_deal_activities(self, deal_id: str) -> dict[str, int]:
-        """取引に紐づくアクティビティ数を種別ごとに取得"""
-        activity_counts = {}
-        for activity_type, obj_type in ASSOCIATION_TYPES.items():
+    print(f"関連会社: {sum(len(v) for v in deal_companies.values())}社を取得")
+    return deal_companies
+
+
+def fetch_deal_activities(client, deal_ids):
+    """取引に関連するアクティビティ数を取得"""
+    deal_activities = {}
+    activity_object_types = ["notes", "emails", "calls", "meetings", "tasks"]
+
+    for deal_id in deal_ids:
+        counts = {}
+        for obj_type in activity_object_types:
             try:
-                associations = (
-                    self.client.crm.deals.associations_api.get_all(
-                        deal_id=deal_id,
-                        to_object_type=obj_type,
-                    )
+                associations = client.crm.deals.associations_api.get_all(
+                    deal_id=deal_id,
+                    to_object_type=obj_type,
                 )
-                activity_counts[activity_type] = len(associations.results)
+                counts[obj_type] = len(associations.results) if associations.results else 0
             except Exception:
-                activity_counts[activity_type] = 0
-        return activity_counts
+                counts[obj_type] = 0
+        deal_activities[deal_id] = counts
+
+    total = sum(sum(c.values()) for c in deal_activities.values())
+    print(f"アクティビティ: 合計{total}件を取得")
+    return deal_activities
 
 
-# --- ユーティリティ ---
-def _parse_float(value) -> float:
-    if value is None or value == "":
-        return 0.0
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def _parse_date(value) -> datetime | None:
-    if value is None or value == "":
-        return None
-    try:
-        # HubSpot returns ISO format or milliseconds
-        if isinstance(value, str) and "T" in value:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(
-                tzinfo=None
-            )
-        return datetime.fromtimestamp(int(value) / 1000)
-    except (ValueError, TypeError):
-        return None
-
-
-def classify_deal(stage: str, stages: dict[str, str]) -> str:
-    """取引ステージをwon/lost/openに分類"""
-    stage_name = stages.get(stage, stage).lower()
-    if "won" in stage_name or "成約" in stage_name or "受注" in stage_name:
-        return "won"
-    elif (
-        "lost" in stage_name
-        or "失注" in stage_name
-        or "closed lost" in stage_name
-    ):
-        return "lost"
+def classify_deal(stage_info):
+    """ステージ情報からWon/Lost/Openを判定"""
+    if not stage_info:
+        return "open"
+    metadata = stage_info.get("metadata", {})
+    if metadata.get("isClosed") == "true":
+        probability = metadata.get("probability", "0")
+        if probability == "1.0" or probability == "1":
+            return "won"
+        else:
+            return "lost"
     return "open"
 
 
-# --- 分析ロジック ---
-def analyze_deals(
-    analyzer: HubSpotAnalyzer,
-    deals: list[dict],
-    stages: dict[str, str],
-) -> dict:
-    """取引データを分析"""
+def analyze_data(deals, stage_map, deal_companies, deal_activities):
+    """データを分析してレポート用の構造化データを返す"""
     results = {
         "total": len(deals),
         "won": [],
         "lost": [],
         "open": [],
-        "activities": {},
-        "companies": {},
-        "monthly_pipeline": defaultdict(lambda: {"count": 0, "amount": 0.0}),
+        "amounts": [],
+        "won_amounts": [],
+        "lead_times": [],
+        "industries": defaultdict(lambda: {"total": 0, "won": 0, "lost": 0, "amount": 0}),
+        "won_reasons": Counter(),
+        "lost_reasons": Counter(),
+        "monthly_pipeline": defaultdict(lambda: {"count": 0, "amount": 0}),
+        "activity_stats": defaultdict(list),
+        "won_activities": [],
+        "highlights": [],
+        "lowlights": [],
     }
 
-    for i, deal in enumerate(deals):
-        status = classify_deal(deal["stage"], stages)
-        results[status].append(deal)
+    for deal in deals:
+        props = deal.properties
+        deal_id = deal.id
+        stage_id = props.get("dealstage", "")
+        stage_info = stage_map.get(stage_id, {})
+        status = classify_deal(stage_info)
+
+        amount = 0
+        try:
+            amount = float(props.get("amount") or 0)
+        except (ValueError, TypeError):
+            pass
+
+        deal_data = {
+            "id": deal_id,
+            "name": props.get("dealname", "不明"),
+            "amount": amount,
+            "stage": stage_info.get("label", stage_id),
+            "pipeline": stage_info.get("pipeline", props.get("pipeline", "不明")),
+            "createdate": props.get("createdate"),
+            "closedate": props.get("closedate"),
+            "status": status,
+        }
 
         # 月別パイプライン
-        if deal["createdate"]:
-            month_key = deal["createdate"].strftime("%Y-%m")
-            results["monthly_pipeline"][month_key]["count"] += 1
-            results["monthly_pipeline"][month_key]["amount"] += deal["amount"]
+        create_str = props.get("createdate")
+        if create_str:
+            try:
+                create_dt = datetime.fromisoformat(create_str.replace("Z", "+00:00"))
+                month_key = create_dt.strftime("%Y-%m")
+                results["monthly_pipeline"][month_key]["count"] += 1
+                results["monthly_pipeline"][month_key]["amount"] += amount
+            except (ValueError, TypeError):
+                pass
 
-        # アクティビティ取得（成約・失注の取引のみ、API呼び出し節約）
-        if status in ("won", "lost"):
-            print(
-                f"  アクティビティ取得中... ({i + 1}/{len(deals)}) {deal['name']}",
-                end="\r",
+        # リードタイム計算
+        lead_time_days = None
+        close_str = props.get("closedate")
+        if create_str and close_str:
+            try:
+                create_dt = datetime.fromisoformat(create_str.replace("Z", "+00:00"))
+                close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                lead_time_days = (close_dt - create_dt).days
+                deal_data["lead_time"] = lead_time_days
+            except (ValueError, TypeError):
+                pass
+
+        # アクティビティ
+        activities = deal_activities.get(deal_id, {})
+        total_activities = sum(activities.values())
+        deal_data["activities"] = activities
+        deal_data["total_activities"] = total_activities
+
+        for act_type, count in activities.items():
+            results["activity_stats"][act_type].append(count)
+
+        if status == "won":
+            results["won"].append(deal_data)
+            results["won_amounts"].append(amount)
+            if lead_time_days is not None:
+                results["lead_times"].append(lead_time_days)
+            results["won_activities"].append(total_activities)
+            reason = props.get("closed_won_reason") or "理由未記載"
+            results["won_reasons"][reason] += 1
+        elif status == "lost":
+            results["lost"].append(deal_data)
+            reason = props.get("closed_lost_reason") or "理由未記載"
+            results["lost_reasons"][reason] += 1
+        else:
+            results["open"].append(deal_data)
+
+        results["amounts"].append(amount)
+
+    # 業界別分析
+    for deal in deals:
+        deal_id = deal.id
+        props = deal.properties
+        stage_id = props.get("dealstage", "")
+        stage_info = stage_map.get(stage_id, {})
+        status = classify_deal(stage_info)
+        amount = 0
+        try:
+            amount = float(props.get("amount") or 0)
+        except (ValueError, TypeError):
+            pass
+
+        companies = deal_companies.get(deal_id, [])
+        for company in companies:
+            industry = (company.properties.get("industry") or "不明").strip()
+            if not industry:
+                industry = "不明"
+            results["industries"][industry]["total"] += 1
+            results["industries"][industry]["amount"] += amount
+            if status == "won":
+                results["industries"][industry]["won"] += 1
+            elif status == "lost":
+                results["industries"][industry]["lost"] += 1
+
+    # ハイライト
+    if results["won"]:
+        top_deal = max(results["won"], key=lambda d: d["amount"])
+        results["highlights"].append(
+            f"最高額成約: **{top_deal['name']}** (¥{top_deal['amount']:,.0f})"
+        )
+        won_with_lt = [d for d in results["won"] if d.get("lead_time") is not None]
+        if won_with_lt:
+            fastest = min(won_with_lt, key=lambda d: d["lead_time"])
+            results["highlights"].append(
+                f"最短成約: **{fastest['name']}** ({fastest['lead_time']}日)"
             )
-            results["activities"][deal["id"]] = analyzer.get_deal_activities(
-                deal["id"]
+
+    # ローライト
+    if results["lost"]:
+        top_lost = max(results["lost"], key=lambda d: d["amount"])
+        results["lowlights"].append(
+            f"最高額失注: **{top_lost['name']}** (¥{top_lost['amount']:,.0f})"
+        )
+        lost_with_lt = [d for d in results["lost"] if d.get("lead_time") is not None]
+        if lost_with_lt:
+            slowest = max(lost_with_lt, key=lambda d: d["lead_time"])
+            results["lowlights"].append(
+                f"最長リードタイム失注: **{slowest['name']}** ({slowest['lead_time']}日)"
             )
 
-            # 会社情報取得
-            companies = analyzer.get_deal_companies(deal["id"])
-            if companies:
-                results["companies"][deal["id"]] = companies
-
-    print()  # 改行
     return results
 
 
-# --- レポート生成 ---
-def generate_report(
-    owner_name: str,
-    period_str: str,
-    start_date: datetime | None,
-    end_date: datetime | None,
-    deals: list[dict],
-    analysis: dict,
-    stages: dict[str, str],
-) -> str:
+def generate_report(results, owner_name, period_str, start_date, end_date):
     """Markdownレポートを生成"""
+    now = datetime.now()
     lines = []
 
-    # ヘッダー
-    lines.append("# HubSpot 営業実績分析レポート")
-    lines.append("")
-    lines.append("## 分析概要")
-    lines.append("")
-    lines.append(f"- **対象者**: {owner_name}")
-    period_display = _format_period(period_str, start_date, end_date)
-    lines.append(f"- **分析期間**: {period_display}")
-    lines.append(
-        f"- **レポート生成日**: {datetime.now().strftime('%Y/%m/%d %H:%M')}"
-    )
-    lines.append("")
+    def add(text=""):
+        lines.append(text)
 
-    won = analysis["won"]
-    lost = analysis["lost"]
-    open_deals = analysis["open"]
-
-    # --- 1. 取引サマリー ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## 1. 取引サマリー")
-    lines.append("")
-
-    total = analysis["total"]
-    won_count = len(won)
-    lost_count = len(lost)
-    open_count = len(open_deals)
-    closed_count = won_count + lost_count
-    win_rate = (won_count / closed_count * 100) if closed_count > 0 else 0
-
-    won_amounts = [d["amount"] for d in won if d["amount"] > 0]
-    avg_won_amount = sum(won_amounts) / len(won_amounts) if won_amounts else 0
-    total_won_amount = sum(won_amounts)
-
-    # リードタイム計算
-    lead_times = []
-    for d in won:
-        close = d["closed_won_date"] or d["closedate"]
-        if close and d["createdate"]:
-            lt = (close - d["createdate"]).days
-            if lt >= 0:
-                lead_times.append(lt)
-    avg_lead_time = sum(lead_times) / len(lead_times) if lead_times else 0
-
-    lines.append("| 指標 | 値 |")
-    lines.append("|---|---|")
-    lines.append(f"| 総取引数 | {total}件 |")
-    lines.append(f"| 成約数 | {won_count}件 |")
-    lines.append(f"| 失注数 | {lost_count}件 |")
-    lines.append(f"| 進行中 | {open_count}件 |")
-    lines.append(f"| 成約率（クローズ済み） | {win_rate:.1f}% |")
-    lines.append(f"| 成約総額 | ¥{total_won_amount:,.0f} |")
-    lines.append(f"| 平均成約額 | ¥{avg_won_amount:,.0f} |")
-    lines.append(f"| 平均リードタイム（成約） | {avg_lead_time:.0f}日 |")
-    lines.append("")
-
-    # --- 2. アクティビティ分析 ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## 2. 成約までのアクティビティ分析")
-    lines.append("")
-
-    activities = analysis["activities"]
-    if activities:
-        # 成約案件のアクティビティ
-        won_activities = {
-            did: acts
-            for did, acts in activities.items()
-            if did in [d["id"] for d in won]
-        }
-        lost_activities = {
-            did: acts
-            for did, acts in activities.items()
-            if did in [d["id"] for d in lost]
-        }
-
-        if won_activities:
-            lines.append("### 成約案件のアクティビティ")
-            lines.append("")
-            total_by_type = Counter()
-            total_per_deal = []
-            for acts in won_activities.values():
-                deal_total = sum(acts.values())
-                total_per_deal.append(deal_total)
-                for atype, count in acts.items():
-                    total_by_type[atype] += count
-
-            avg_total = (
-                sum(total_per_deal) / len(total_per_deal)
-                if total_per_deal
-                else 0
-            )
-            lines.append(
-                f"- **平均アクティビティ数（成約1件あたり）**: {avg_total:.1f}件"
-            )
-            lines.append("")
-            lines.append("| アクティビティ種別 | 合計数 | 平均（1件あたり） |")
-            lines.append("|---|---|---|")
-            type_labels = {
-                "notes": "メモ",
-                "emails": "メール",
-                "calls": "電話",
-                "meetings": "ミーティング",
-                "tasks": "タスク",
-            }
-            for atype, label in type_labels.items():
-                total_c = total_by_type.get(atype, 0)
-                avg_c = total_c / len(won_activities) if won_activities else 0
-                lines.append(f"| {label} | {total_c} | {avg_c:.1f} |")
-            lines.append("")
-
-        if lost_activities:
-            lines.append("### 失注案件のアクティビティ")
-            lines.append("")
-            total_by_type = Counter()
-            total_per_deal = []
-            for acts in lost_activities.values():
-                deal_total = sum(acts.values())
-                total_per_deal.append(deal_total)
-                for atype, count in acts.items():
-                    total_by_type[atype] += count
-
-            avg_total = (
-                sum(total_per_deal) / len(total_per_deal)
-                if total_per_deal
-                else 0
-            )
-            lines.append(
-                f"- **平均アクティビティ数（失注1件あたり）**: {avg_total:.1f}件"
-            )
-            lines.append("")
-            lines.append("| アクティビティ種別 | 合計数 | 平均（1件あたり） |")
-            lines.append("|---|---|---|")
-            for atype, label in type_labels.items():
-                total_c = total_by_type.get(atype, 0)
-                avg_c = total_c / len(lost_activities) if lost_activities else 0
-                lines.append(f"| {label} | {total_c} | {avg_c:.1f} |")
-            lines.append("")
+    add("# HubSpot 営業実績分析レポート")
+    add()
+    add("## 分析概要")
+    add()
+    add(f"- **対象**: {owner_name}")
+    if start_date and end_date:
+        add(f"- **期間**: {start_date.strftime('%Y/%m/%d')} - {end_date.strftime('%Y/%m/%d')}")
     else:
-        lines.append("アクティビティデータがありません。")
-        lines.append("")
+        add("- **期間**: 全期間")
+    add(f"- **生成日**: {now.strftime('%Y/%m/%d %H:%M')}")
+    add()
 
-    # --- 3. 取引金額分析 ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## 3. 取引金額分析")
-    lines.append("")
+    # 1. 取引サマリー
+    add("---")
+    add()
+    add("## 1. 取引サマリー")
+    add()
 
-    all_amounts = [d["amount"] for d in deals if d["amount"] > 0]
-    if all_amounts:
-        # 金額帯分布
+    won_count = len(results["won"])
+    lost_count = len(results["lost"])
+    open_count = len(results["open"])
+    decided = won_count + lost_count
+    win_rate = (won_count / decided * 100) if decided > 0 else 0
+    avg_won = (sum(results["won_amounts"]) / won_count) if won_count > 0 else 0
+    avg_lead = (sum(results["lead_times"]) / len(results["lead_times"])) if results["lead_times"] else 0
+    total_won_amount = sum(results["won_amounts"])
+    total_amount = sum(results["amounts"])
+
+    add("| 指標 | 値 |")
+    add("|---|---|")
+    add(f"| 総取引数 | {results['total']}件 |")
+    add(f"| 成約数 | {won_count}件 |")
+    add(f"| 失注数 | {lost_count}件 |")
+    add(f"| 進行中 | {open_count}件 |")
+    add(f"| 成約率 | {win_rate:.1f}% |")
+    add(f"| 成約合計金額 | ¥{total_won_amount:,.0f} |")
+    add(f"| 平均成約額 | ¥{avg_won:,.0f} |")
+    add(f"| 平均リードタイム（成約） | {avg_lead:.1f}日 |")
+    add(f"| パイプライン総額 | ¥{total_amount:,.0f} |")
+    add()
+
+    # 2. アクティビティ分析
+    add("---")
+    add()
+    add("## 2. 成約までのアクティビティ分析")
+    add()
+
+    if results["won_activities"]:
+        avg_activities = sum(results["won_activities"]) / len(results["won_activities"])
+        add(f"成約案件の平均アクティビティ数: **{avg_activities:.1f}件**")
+        add()
+
+    add("### アクティビティ種別の内訳（全案件）")
+    add()
+    add("| 種別 | 合計 | 平均/案件 |")
+    add("|---|---|---|")
+    for act_type, label in ACTIVITY_TYPES.items():
+        counts = results["activity_stats"].get(act_type, [])
+        total_act = sum(counts)
+        avg_act = (total_act / len(counts)) if counts else 0
+        add(f"| {label} | {total_act}件 | {avg_act:.1f}件 |")
+    add()
+
+    if results["won"]:
+        add("### 成約案件のアクティビティ詳細（上位5件）")
+        add()
+        add("| 案件名 | 金額 | リードタイム | アクティビティ数 |")
+        add("|---|---|---|---|")
+        sorted_won = sorted(results["won"], key=lambda d: d["amount"], reverse=True)[:5]
+        for d in sorted_won:
+            lt = f"{d.get('lead_time', '-')}日" if d.get("lead_time") is not None else "-"
+            add(f"| {d['name']} | ¥{d['amount']:,.0f} | {lt} | {d['total_activities']}件 |")
+        add()
+
+    # 3. 取引金額分析
+    add("---")
+    add()
+    add("## 3. 取引金額分析")
+    add()
+
+    non_zero = [a for a in results["amounts"] if a > 0]
+    if non_zero:
+        add("### 金額帯別の取引分布")
+        add()
         brackets = [
-            (0, 100000, "~10万"),
-            (100000, 500000, "10万~50万"),
-            (500000, 1000000, "50万~100万"),
-            (1000000, 5000000, "100万~500万"),
-            (5000000, 10000000, "500万~1000万"),
-            (10000000, float("inf"), "1000万~"),
+            (0, 100000, "~¥100,000"),
+            (100000, 500000, "¥100,000~¥500,000"),
+            (500000, 1000000, "¥500,000~¥1,000,000"),
+            (1000000, 5000000, "¥1,000,000~¥5,000,000"),
+            (5000000, 10000000, "¥5,000,000~¥10,000,000"),
+            (10000000, float("inf"), "¥10,000,000~"),
         ]
-
-        lines.append("### 金額帯別分布")
-        lines.append("")
-        lines.append("| 金額帯 | 取引数 | 割合 |")
-        lines.append("|---|---|---|")
+        add("| 金額帯 | 件数 |")
+        add("|---|---|")
         for low, high, label in brackets:
-            count = sum(1 for a in all_amounts if low <= a < high)
+            count = len([a for a in non_zero if low <= a < high])
             if count > 0:
-                pct = count / len(all_amounts) * 100
-                lines.append(f"| {label} | {count}件 | {pct:.1f}% |")
-        lines.append("")
+                add(f"| {label} | {count}件 |")
+        add()
 
-        # 月別推移
-        monthly = defaultdict(lambda: {"count": 0, "won_amount": 0.0})
-        for d in won:
-            close = d["closed_won_date"] or d["closedate"]
-            if close:
-                mk = close.strftime("%Y-%m")
-                monthly[mk]["count"] += 1
-                monthly[mk]["won_amount"] += d["amount"]
+    if results["monthly_pipeline"]:
+        add("### 月別の取引金額推移")
+        add()
+        add("| 月 | 新規件数 | 新規金額 |")
+        add("|---|---|---|")
+        for month in sorted(results["monthly_pipeline"].keys()):
+            data = results["monthly_pipeline"][month]
+            add(f"| {month} | {data['count']}件 | ¥{data['amount']:,.0f} |")
+        add()
 
-        if monthly:
-            lines.append("### 月別成約推移")
-            lines.append("")
-            lines.append("| 月 | 成約数 | 成約金額 |")
-            lines.append("|---|---|---|")
-            for mk in sorted(monthly.keys()):
-                m = monthly[mk]
-                lines.append(
-                    f"| {mk} | {m['count']}件 | ¥{m['won_amount']:,.0f} |"
-                )
-            lines.append("")
-    else:
-        lines.append("金額データがありません。")
-        lines.append("")
+    # 4. 業界別分析
+    add("---")
+    add()
+    add("## 4. 業界・業種別分析")
+    add()
 
-    # --- 4. 業界・業種別分析 ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## 4. 業界・業種別分析")
-    lines.append("")
-
-    companies = analysis["companies"]
-    if companies:
-        industry_stats = defaultdict(
-            lambda: {"total": 0, "won": 0, "amount": 0.0}
+    if results["industries"]:
+        add("| 業界 | 取引数 | 成約数 | 失注数 | 成約率 | 合計金額 |")
+        add("|---|---|---|---|---|---|")
+        sorted_industries = sorted(
+            results["industries"].items(),
+            key=lambda x: x[1]["amount"],
+            reverse=True,
         )
-        won_ids = {d["id"] for d in won}
-
-        for deal_id, comps in companies.items():
-            for comp in comps:
-                ind = comp.get("industry") or "不明"
-                industry_stats[ind]["total"] += 1
-                if deal_id in won_ids:
-                    industry_stats[ind]["won"] += 1
-                    # 対応するDealの金額を取得
-                    for d in deals:
-                        if d["id"] == deal_id:
-                            industry_stats[ind]["amount"] += d["amount"]
-                            break
-
-        lines.append("| 業界 | 取引数 | 成約数 | 成約率 | 成約合計金額 |")
-        lines.append("|---|---|---|---|---|")
-        for ind, stats in sorted(
-            industry_stats.items(), key=lambda x: x[1]["amount"], reverse=True
-        ):
-            wr = (
-                stats["won"] / stats["total"] * 100
-                if stats["total"] > 0
-                else 0
+        for industry, data in sorted_industries:
+            decided_ind = data["won"] + data["lost"]
+            rate = (data["won"] / decided_ind * 100) if decided_ind > 0 else 0
+            add(
+                f"| {industry} | {data['total']}件 | {data['won']}件 | {data['lost']}件 | {rate:.0f}% | ¥{data['amount']:,.0f} |"
             )
-            lines.append(
-                f"| {ind} | {stats['total']}件 | {stats['won']}件 "
-                f"| {wr:.0f}% | ¥{stats['amount']:,.0f} |"
-            )
-        lines.append("")
+        add()
     else:
-        lines.append("業界データがありません（会社情報が取引に紐づいていない可能性）。")
-        lines.append("")
+        add("（関連する会社データがありません）")
+        add()
 
-    # --- 5. 成約/失注理由分析 ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## 5. 成約/失注理由分析")
-    lines.append("")
+    # 5. 成約/失注理由分析
+    add("---")
+    add()
+    add("## 5. 成約/失注理由分析")
+    add()
 
-    # 成約理由
-    won_reasons = Counter()
-    for d in won:
-        reason = d.get("closed_won_reason") or "理由未記入"
-        won_reasons[reason] += 1
-
-    if won_reasons:
-        lines.append("### 成約理由")
-        lines.append("")
-        lines.append("| 理由 | 件数 | 割合 |")
-        lines.append("|---|---|---|")
-        for reason, count in won_reasons.most_common():
-            pct = count / len(won) * 100 if won else 0
-            lines.append(f"| {reason} | {count}件 | {pct:.1f}% |")
-        lines.append("")
-
-    # 失注理由
-    lost_reasons = Counter()
-    for d in lost:
-        reason = d.get("closed_lost_reason") or "理由未記入"
-        lost_reasons[reason] += 1
-
-    if lost_reasons:
-        lines.append("### 失注理由")
-        lines.append("")
-        lines.append("| 理由 | 件数 | 割合 |")
-        lines.append("|---|---|---|")
-        for reason, count in lost_reasons.most_common():
-            pct = count / len(lost) * 100 if lost else 0
-            lines.append(f"| {reason} | {count}件 | {pct:.1f}% |")
-        lines.append("")
-
-    if not won_reasons and not lost_reasons:
-        lines.append("成約/失注理由のデータがありません。")
-        lines.append("")
-
-    # --- 6. パイプライン推移 ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## 6. パイプライン推移")
-    lines.append("")
-
-    monthly_pipeline = analysis["monthly_pipeline"]
-    if monthly_pipeline:
-        lines.append("| 月 | 新規パイプライン数 | 新規パイプライン金額 | 累積金額 |")
-        lines.append("|---|---|---|---|")
-        cumulative = 0.0
-        for mk in sorted(monthly_pipeline.keys()):
-            m = monthly_pipeline[mk]
-            cumulative += m["amount"]
-            lines.append(
-                f"| {mk} | {m['count']}件 "
-                f"| ¥{m['amount']:,.0f} | ¥{cumulative:,.0f} |"
-            )
-        lines.append("")
+    add("### 成約理由")
+    add()
+    if results["won_reasons"]:
+        add("| 理由 | 件数 |")
+        add("|---|---|")
+        for reason, count in results["won_reasons"].most_common():
+            add(f"| {reason} | {count}件 |")
+        add()
     else:
-        lines.append("パイプラインデータがありません。")
-        lines.append("")
+        add("（成約案件なし）")
+        add()
 
-    # --- 7. ハイライト ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## 7. ハイライト")
-    lines.append("")
-
-    if won:
-        # 最高額の成約
-        top_won = max(won, key=lambda d: d["amount"])
-        lines.append(
-            f"- **最高額成約**: {top_won['name']} — ¥{top_won['amount']:,.0f}"
-        )
-
-        # 最短リードタイム
-        if lead_times:
-            min_lt = min(lead_times)
-            for d in won:
-                close = d["closed_won_date"] or d["closedate"]
-                if close and d["createdate"]:
-                    lt = (close - d["createdate"]).days
-                    if lt == min_lt:
-                        lines.append(
-                            f"- **最短リードタイム成約**: {d['name']} — {lt}日"
-                        )
-                        break
-
-        # 成約率が高い業界
-        if companies:
-            best_industry = None
-            best_rate = 0
-            for ind, stats in industry_stats.items():
-                if stats["total"] >= 2:  # 最低2件以上
-                    rate = stats["won"] / stats["total"]
-                    if rate > best_rate:
-                        best_rate = rate
-                        best_industry = ind
-            if best_industry:
-                lines.append(
-                    f"- **成約率トップ業界**: {best_industry} "
-                    f"— {best_rate * 100:.0f}%"
-                )
-
-        # 最高額の月
-        if monthly_pipeline:
-            best_month = max(
-                monthly_pipeline.items(), key=lambda x: x[1]["amount"]
-            )
-            lines.append(
-                f"- **最高パイプライン月**: {best_month[0]} "
-                f"— ¥{best_month[1]['amount']:,.0f} "
-                f"（{best_month[1]['count']}件）"
-            )
+    add("### 失注理由")
+    add()
+    if results["lost_reasons"]:
+        add("| 理由 | 件数 |")
+        add("|---|---|")
+        for reason, count in results["lost_reasons"].most_common():
+            add(f"| {reason} | {count}件 |")
+        add()
     else:
-        lines.append("成約データがないためハイライトを表示できません。")
-    lines.append("")
+        add("（失注案件なし）")
+        add()
 
-    # --- 8. ローライト ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## 8. ローライト")
-    lines.append("")
+    # 6. パイプライン推移
+    add("---")
+    add()
+    add("## 6. パイプライン推移")
+    add()
 
-    if lost:
-        # 最高額の失注
-        top_lost = max(lost, key=lambda d: d["amount"])
-        lines.append(
-            f"- **最高額失注**: {top_lost['name']} "
-            f"— ¥{top_lost['amount']:,.0f}"
-        )
-        if top_lost.get("closed_lost_reason"):
-            lines.append(f"  - 理由: {top_lost['closed_lost_reason']}")
-
-        # 最長リードタイムで失注
-        lost_lead_times = []
-        for d in lost:
-            if d["closedate"] and d["createdate"]:
-                lt = (d["closedate"] - d["createdate"]).days
-                if lt >= 0:
-                    lost_lead_times.append((d, lt))
-        if lost_lead_times:
-            longest = max(lost_lead_times, key=lambda x: x[1])
-            lines.append(
-                f"- **最長リードタイム失注**: {longest[0]['name']} — {longest[1]}日"
+    if results["monthly_pipeline"]:
+        add("| 月 | 新規パイプライン数 | 新規パイプライン金額 | 累積件数 | 累積金額 |")
+        add("|---|---|---|---|---|")
+        cumulative_count = 0
+        cumulative_amount = 0
+        for month in sorted(results["monthly_pipeline"].keys()):
+            data = results["monthly_pipeline"][month]
+            cumulative_count += data["count"]
+            cumulative_amount += data["amount"]
+            add(
+                f"| {month} | {data['count']}件 | ¥{data['amount']:,.0f} | {cumulative_count}件 | ¥{cumulative_amount:,.0f} |"
             )
-
-        # 最も多い失注理由
-        if lost_reasons:
-            top_reason = lost_reasons.most_common(1)[0]
-            lines.append(
-                f"- **最多失注理由**: {top_reason[0]} — {top_reason[1]}件"
-            )
+        add()
     else:
-        lines.append("失注データがないためローライトを表示できません。")
-    lines.append("")
+        add("（データなし）")
+        add()
 
-    # --- 改善提案 ---
-    lines.append("---")
-    lines.append("")
-    lines.append("## 9. 次の戦略への提案")
-    lines.append("")
+    # 7. ハイライト
+    add("---")
+    add()
+    add("## 7. ハイライト")
+    add()
+    if results["highlights"]:
+        for h in results["highlights"]:
+            add(f"- {h}")
+    else:
+        add("（特筆事項なし）")
 
-    if won and lost:
-        lines.append("上記データに基づく示唆:")
-        lines.append("")
-        if win_rate >= 50:
-            lines.append(
-                f"- 成約率 {win_rate:.1f}% は良好。"
-                "パイプライン拡大で売上増を狙えます"
-            )
-        else:
-            lines.append(
-                f"- 成約率 {win_rate:.1f}% に改善余地。"
-                "案件の質の向上やフォローアップ強化を検討"
-            )
+    if results["industries"]:
+        best_industry = None
+        best_rate = 0
+        for ind, data in results["industries"].items():
+            decided_ind = data["won"] + data["lost"]
+            if decided_ind >= 2:
+                rate = data["won"] / decided_ind
+                if rate > best_rate:
+                    best_rate = rate
+                    best_industry = ind
+        if best_industry:
+            add(f"- 成約率が高い業界: **{best_industry}** ({best_rate*100:.0f}%)")
+    add()
 
-        if avg_lead_time > 90:
-            lines.append(
-                f"- 平均リードタイム {avg_lead_time:.0f}日は長め。"
-                "商談プロセスの短縮を検討"
-            )
+    # 8. ローライト
+    add("---")
+    add()
+    add("## 8. ローライト")
+    add()
+    if results["lowlights"]:
+        for ll in results["lowlights"]:
+            add(f"- {ll}")
+    else:
+        add("（特筆事項なし）")
 
-        if lost_reasons:
-            top_lost_reason = lost_reasons.most_common(1)[0]
-            lines.append(
-                f"- 失注理由トップ「{top_lost_reason[0]}」への対策を優先"
-            )
-    lines.append("")
+    if results["lost_reasons"]:
+        top_reason = results["lost_reasons"].most_common(1)[0]
+        add(f"- 最多失注理由「{top_reason[0]}」({top_reason[1]}件) への対策検討を推奨")
+    if results["lead_times"]:
+        long_deals = [d for d in results["won"] if d.get("lead_time", 0) > avg_lead * 1.5]
+        if long_deals:
+            add(f"- 平均より50%以上長いリードタイムの成約案件が{len(long_deals)}件 — プロセス改善の余地あり")
+    add()
+
+    add("---")
+    add(f"*レポート生成: {now.strftime('%Y/%m/%d %H:%M')}*")
 
     return "\n".join(lines)
 
 
-def _format_period(
-    period_str: str,
-    start_date: datetime | None,
-    end_date: datetime | None,
-) -> str:
-    if period_str == "all":
-        return "全期間"
-    elif start_date and end_date:
-        return (
-            f"{start_date.strftime('%Y/%m/%d')} - "
-            f"{end_date.strftime('%Y/%m/%d')}"
-        )
-    return period_str
-
-
-# --- メイン ---
 def main():
-    parser = argparse.ArgumentParser(
-        description="HubSpot 営業実績分析ツール",
-    )
-    parser.add_argument(
-        "--period",
-        default="all",
-        help="分析期間: all, 1y, 6m, quarter, YYYY-MM-DD:YYYY-MM-DD",
-    )
-    parser.add_argument(
-        "--owner",
-        default="Hideaki Kawano",
-        help="オーナー名（部分一致検索、デフォルト: Hideaki Kawano）",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="出力ファイルパス（デフォルト: reports/sales_report_YYYYMMDD.md）",
-    )
-    args = parser.parse_args()
+    args = parse_args()
 
-    # APIキー確認
-    api_key = os.environ.get("HUBSPOT_API_KEY")
+    api_key = os.getenv("HUBSPOT_API_KEY")
     if not api_key:
         print("エラー: HUBSPOT_API_KEY が設定されていません。")
-        print(".envファイルにPrivate App Tokenを設定してください。")
-        print("詳細は README.md を参照してください。")
+        print(".env ファイルにトークンを設定してください。")
         sys.exit(1)
 
-    # 期間パース
-    start_date, end_date = parse_period(args.period)
+    print("HubSpot に接続中...")
+    client = HubSpot(access_token=api_key)
 
-    print("=" * 50)
-    print("HubSpot 営業実績分析")
-    print("=" * 50)
+    owner_id, owner_name = find_owner(client, args.owner)
 
-    # HubSpot API接続
-    analyzer = HubSpotAnalyzer(api_key)
+    start_date, end_date = get_date_range(args.period)
+    if start_date:
+        print(f"期間: {start_date.strftime('%Y/%m/%d')} - {end_date.strftime('%Y/%m/%d')}")
+    else:
+        print("期間: 全期間")
 
-    # 1. オーナー検索
-    print(f"\n[1/5] オーナー検索: {args.owner}")
-    owner_id = analyzer.find_owner(args.owner)
-    if not owner_id:
-        print(f"エラー: オーナー '{args.owner}' が見つかりません。")
-        sys.exit(1)
+    print("パイプライン情報を取得中...")
+    stage_map, pipeline_map = fetch_pipeline_stages(client)
 
-    # 2. パイプラインステージ取得
-    print("\n[2/5] パイプライン情報取得中...")
-    stages = analyzer.get_pipeline_stages()
-    print(f"  {len(stages)}ステージ検出")
-
-    # 3. 取引取得
-    print(f"\n[3/5] 取引データ取得中（期間: {args.period}）...")
-    deals = analyzer.get_deals(owner_id, start_date, end_date)
+    print("取引データを取得中...")
+    deals = fetch_deals(client, owner_id, start_date, end_date)
 
     if not deals:
-        print("取引データが見つかりません。期間やオーナー名を確認してください。")
+        print("取引が見つかりませんでした。")
         sys.exit(0)
 
-    # 4. 分析
-    print("\n[4/5] データ分析中...")
-    analysis = analyze_deals(analyzer, deals, stages)
+    deal_ids = [d.id for d in deals]
 
-    # 5. レポート生成
-    print("\n[5/5] レポート生成中...")
-    report = generate_report(
-        args.owner,
-        args.period,
-        start_date,
-        end_date,
-        deals,
-        analysis,
-        stages,
-    )
+    print("関連会社データを取得中...")
+    deal_companies = fetch_associated_companies(client, deal_ids)
 
-    # 出力
-    output_path = args.output or os.path.join(
-        "reports",
-        f"sales_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-    )
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    print("アクティビティデータを取得中...")
+    deal_activities = fetch_deal_activities(client, deal_ids)
 
+    print("データを分析中...")
+    analysis = analyze_data(deals, stage_map, deal_companies, deal_activities)
+
+    print("レポートを生成中...")
+    report = generate_report(analysis, owner_name, args.period, start_date, end_date)
+
+    output_path = args.output or f"reports/sales_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(report)
 
-    print(f"\nレポートを出力しました: {output_path}")
-    print("=" * 50)
+    print(f"\nレポートを保存しました: {output_path}")
+    print("完了!")
 
 
 if __name__ == "__main__":

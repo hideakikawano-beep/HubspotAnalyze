@@ -172,30 +172,40 @@ def fetch_pipeline_stages(client):
     return stage_map, pipeline_map
 
 
+def _get_associations_v4(client, deal_id, to_object_type):
+    """v4 Associations APIで関連オブジェクトIDを取得"""
+    try:
+        response = client.crm.associations.v4.basic_api.get_page(
+            object_type="deals",
+            object_id=deal_id,
+            to_object_type=to_object_type,
+            limit=500,
+        )
+        if response and response.results:
+            return [r.to_object_id for r in response.results]
+    except Exception:
+        pass
+    return []
+
+
 def fetch_associated_companies(client, deal_ids):
     """取引に関連する会社を一括取得"""
     deal_companies = {}
 
     for deal_id in deal_ids:
-        try:
-            associations = client.crm.deals.associations_api.get_all(
-                deal_id=deal_id,
-                to_object_type="companies",
-            )
-            company_ids = [a.id for a in associations.results] if associations.results else []
-            if company_ids:
-                companies = []
-                for cid in company_ids:
-                    try:
-                        company = client.crm.companies.basic_api.get_by_id(
-                            company_id=cid, properties=COMPANY_PROPERTIES
-                        )
-                        companies.append(company)
-                    except Exception:
-                        pass
+        company_ids = _get_associations_v4(client, deal_id, "companies")
+        if company_ids:
+            companies = []
+            for cid in company_ids:
+                try:
+                    company = client.crm.companies.basic_api.get_by_id(
+                        company_id=cid, properties=COMPANY_PROPERTIES
+                    )
+                    companies.append(company)
+                except Exception:
+                    pass
+            if companies:
                 deal_companies[deal_id] = companies
-        except Exception:
-            pass
 
     print(f"関連会社: {sum(len(v) for v in deal_companies.values())}社を取得")
     return deal_companies
@@ -209,14 +219,8 @@ def fetch_deal_activities(client, deal_ids):
     for deal_id in deal_ids:
         counts = {}
         for obj_type in activity_object_types:
-            try:
-                associations = client.crm.deals.associations_api.get_all(
-                    deal_id=deal_id,
-                    to_object_type=obj_type,
-                )
-                counts[obj_type] = len(associations.results) if associations.results else 0
-            except Exception:
-                counts[obj_type] = 0
+            ids = _get_associations_v4(client, deal_id, obj_type)
+            counts[obj_type] = len(ids)
         deal_activities[deal_id] = counts
 
     total = sum(sum(c.values()) for c in deal_activities.values())
@@ -301,7 +305,8 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
                 create_dt = datetime.fromisoformat(create_str.replace("Z", "+00:00"))
                 close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
                 lead_time_days = (close_dt - create_dt).days
-                deal_data["lead_time"] = lead_time_days
+                if lead_time_days >= 0:
+                    deal_data["lead_time"] = lead_time_days
             except (ValueError, TypeError):
                 pass
 
@@ -362,7 +367,7 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
         results["highlights"].append(
             f"最高額成約: **{top_deal['name']}** (¥{top_deal['amount']:,.0f})"
         )
-        won_with_lt = [d for d in results["won"] if d.get("lead_time") is not None]
+        won_with_lt = [d for d in results["won"] if d.get("lead_time") is not None and d["lead_time"] >= 0]
         if won_with_lt:
             fastest = min(won_with_lt, key=lambda d: d["lead_time"])
             results["highlights"].append(

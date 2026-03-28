@@ -398,11 +398,18 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
         "open": [],
         "amounts": [],
         "won_amounts": [],
+        "lost_amounts": [],
+        "open_amounts": [],
         "lead_times": [],
-        "industries": defaultdict(lambda: {"total": 0, "won": 0, "lost": 0, "amount": 0}),
+        "industries": defaultdict(lambda: {"total": 0, "won": 0, "lost": 0, "open": 0, "amount_total": 0, "amount_won": 0}),
         "won_reasons": Counter(),
         "lost_reasons": Counter(),
+        # パイプライン（新規作成ベース）
         "monthly_pipeline": defaultdict(lambda: {"count": 0, "amount": 0}),
+        # 成約（成約日ベース）
+        "monthly_won": defaultdict(lambda: {"count": 0, "amount": 0}),
+        # 失注（closedate ベース）
+        "monthly_lost": defaultdict(lambda: {"count": 0, "amount": 0}),
         "activity_stats": defaultdict(list),
         "won_activities": [],
         "highlights": [],
@@ -433,7 +440,7 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
             "status": status,
         }
 
-        # 月別パイプライン
+        # 月別パイプライン（作成日ベース = 新規パイプライン）
         create_str = props.get("createdate")
         if create_str:
             try:
@@ -457,6 +464,20 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
             except (ValueError, TypeError):
                 pass
 
+        # 月別成約・失注（成約/失注日ベース）
+        if close_str and status in ("won", "lost"):
+            try:
+                close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                close_month = close_dt.strftime("%Y-%m")
+                if status == "won":
+                    results["monthly_won"][close_month]["count"] += 1
+                    results["monthly_won"][close_month]["amount"] += amount
+                else:
+                    results["monthly_lost"][close_month]["count"] += 1
+                    results["monthly_lost"][close_month]["amount"] += amount
+            except (ValueError, TypeError):
+                pass
+
         # アクティビティ
         activities = deal_activities.get(deal_id, {})
         total_activities = sum(activities.values())
@@ -476,10 +497,12 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
             results["won_reasons"][reason] += 1
         elif status == "lost":
             results["lost"].append(deal_data)
+            results["lost_amounts"].append(amount)
             reason = props.get("closed_lost_reason") or "理由未記載"
             results["lost_reasons"][reason] += 1
         else:
             results["open"].append(deal_data)
+            results["open_amounts"].append(amount)
 
         results["amounts"].append(amount)
 
@@ -503,9 +526,10 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
                 if not industry:
                     industry = "不明"
                 results["industries"][industry]["total"] += 1
-                results["industries"][industry]["amount"] += amount
+                results["industries"][industry]["amount_total"] += amount
                 if status == "won":
                     results["industries"][industry]["won"] += 1
+                    results["industries"][industry]["amount_won"] += amount
                 elif status == "lost":
                     results["industries"][industry]["lost"] += 1
         else:
@@ -513,9 +537,10 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
             company_name = extract_company_from_dealname(props.get("dealname", ""))
             industry = get_industry_for_company(company_name)
             results["industries"][industry]["total"] += 1
-            results["industries"][industry]["amount"] += amount
+            results["industries"][industry]["amount_total"] += amount
             if status == "won":
                 results["industries"][industry]["won"] += 1
+                results["industries"][industry]["amount_won"] += amount
             elif status == "lost":
                 results["industries"][industry]["lost"] += 1
 
@@ -568,12 +593,7 @@ def generate_report(results, owner_name, period_str, start_date, end_date):
     add(f"- **生成日**: {now.strftime('%Y/%m/%d %H:%M')}")
     add()
 
-    # 1. 取引サマリー
-    add("---")
-    add()
-    add("## 1. 取引サマリー")
-    add()
-
+    # === 共通変数 ===
     won_count = len(results["won"])
     lost_count = len(results["lost"])
     open_count = len(results["open"])
@@ -582,25 +602,141 @@ def generate_report(results, owner_name, period_str, start_date, end_date):
     avg_won = (sum(results["won_amounts"]) / won_count) if won_count > 0 else 0
     avg_lead = (sum(results["lead_times"]) / len(results["lead_times"])) if results["lead_times"] else 0
     total_won_amount = sum(results["won_amounts"])
+    total_lost_amount = sum(results["lost_amounts"])
+    total_open_amount = sum(results["open_amounts"])
     total_amount = sum(results["amounts"])
+
+    # =============================================
+    # 1. 成約実績サマリー
+    # =============================================
+    add("---")
+    add()
+    add("## 1. 成約実績")
+    add()
 
     add("| 指標 | 値 |")
     add("|---|---|")
-    add(f"| 総取引数 | {results['total']}件 |")
     add(f"| 成約数 | {won_count}件 |")
-    add(f"| 失注数 | {lost_count}件 |")
-    add(f"| 進行中 | {open_count}件 |")
-    add(f"| 成約率 | {win_rate:.1f}% |")
     add(f"| 成約合計金額 | ¥{total_won_amount:,.0f} |")
     add(f"| 平均成約額 | ¥{avg_won:,.0f} |")
-    add(f"| 平均リードタイム（成約） | {avg_lead:.1f}日 |")
-    add(f"| パイプライン総額 | ¥{total_amount:,.0f} |")
+    add(f"| 平均リードタイム | {avg_lead:.1f}日 |")
+    add(f"| 成約率（成約/決着済） | {win_rate:.1f}%（{won_count}/{decided}件） |")
     add()
 
-    # 2. アクティビティ分析
+    # 月別成約推移
+    if results["monthly_won"]:
+        add("### 月別成約推移")
+        add()
+        add("| 月 | 成約件数 | 成約金額 | 累積件数 | 累積金額 |")
+        add("|---|---|---|---|---|")
+        cum_cnt = 0
+        cum_amt = 0
+        for month in sorted(results["monthly_won"].keys()):
+            data = results["monthly_won"][month]
+            cum_cnt += data["count"]
+            cum_amt += data["amount"]
+            add(f"| {month} | {data['count']}件 | ¥{data['amount']:,.0f} | {cum_cnt}件 | ¥{cum_amt:,.0f} |")
+        add()
+
+    # 成約案件一覧（上位10件）
+    if results["won"]:
+        add("### 成約案件（金額上位10件）")
+        add()
+        add("| 案件名 | 金額 | リードタイム | アクティビティ数 |")
+        add("|---|---|---|---|")
+        sorted_won = sorted(results["won"], key=lambda d: d["amount"], reverse=True)[:10]
+        for d in sorted_won:
+            lt = f"{d.get('lead_time', '-')}日" if d.get("lead_time") is not None else "-"
+            add(f"| {d['name']} | ¥{d['amount']:,.0f} | {lt} | {d['total_activities']}件 |")
+        add()
+
+    # 成約金額帯分布
+    won_non_zero = [a for a in results["won_amounts"] if a > 0]
+    if won_non_zero:
+        add("### 成約金額帯別の分布")
+        add()
+        brackets = [
+            (0, 100000, "~¥100,000"),
+            (100000, 500000, "¥100,000~¥500,000"),
+            (500000, 1000000, "¥500,000~¥1,000,000"),
+            (1000000, 5000000, "¥1,000,000~¥5,000,000"),
+            (5000000, 10000000, "¥5,000,000~¥10,000,000"),
+            (10000000, float("inf"), "¥10,000,000~"),
+        ]
+        add("| 金額帯 | 件数 | 小計 |")
+        add("|---|---|---|")
+        for low, high, label in brackets:
+            matched = [a for a in won_non_zero if low <= a < high]
+            if matched:
+                add(f"| {label} | {len(matched)}件 | ¥{sum(matched):,.0f} |")
+        add()
+
+    # =============================================
+    # 2. パイプライン（新規作成）
+    # =============================================
     add("---")
     add()
-    add("## 2. 成約までのアクティビティ分析")
+    add("## 2. パイプライン（新規作成）")
+    add()
+
+    add("| 指標 | 値 |")
+    add("|---|---|")
+    add(f"| 期間内の新規パイプライン総数 | {results['total']}件 |")
+    add(f"| 新規パイプライン総額 | ¥{total_amount:,.0f} |")
+    add(f"| うち進行中 | {open_count}件（¥{total_open_amount:,.0f}） |")
+    add(f"| うち成約 | {won_count}件（¥{total_won_amount:,.0f}） |")
+    add(f"| うち失注 | {lost_count}件（¥{total_lost_amount:,.0f}） |")
+    add()
+
+    # 月別パイプライン推移
+    if results["monthly_pipeline"]:
+        add("### 月別パイプライン推移（作成日ベース）")
+        add()
+        all_months = sorted(set(
+            list(results["monthly_pipeline"].keys()) +
+            list(results["monthly_won"].keys()) +
+            list(results["monthly_lost"].keys())
+        ))
+        add("| 月 | 新規PL件数 | 新規PL金額 | 成約件数 | 成約金額 | 失注件数 | 失注金額 |")
+        add("|---|---|---|---|---|---|---|")
+        for month in all_months:
+            pl = results["monthly_pipeline"].get(month, {"count": 0, "amount": 0})
+            wo = results["monthly_won"].get(month, {"count": 0, "amount": 0})
+            lo = results["monthly_lost"].get(month, {"count": 0, "amount": 0})
+            add(
+                f"| {month} | {pl['count']}件 | ¥{pl['amount']:,.0f}"
+                f" | {wo['count']}件 | ¥{wo['amount']:,.0f}"
+                f" | {lo['count']}件 | ¥{lo['amount']:,.0f} |"
+            )
+        add()
+
+    # パイプライン金額帯分布
+    all_non_zero = [a for a in results["amounts"] if a > 0]
+    if all_non_zero:
+        add("### パイプライン金額帯別の分布（全取引）")
+        add()
+        brackets = [
+            (0, 100000, "~¥100,000"),
+            (100000, 500000, "¥100,000~¥500,000"),
+            (500000, 1000000, "¥500,000~¥1,000,000"),
+            (1000000, 5000000, "¥1,000,000~¥5,000,000"),
+            (5000000, 10000000, "¥5,000,000~¥10,000,000"),
+            (10000000, float("inf"), "¥10,000,000~"),
+        ]
+        add("| 金額帯 | 件数 |")
+        add("|---|---|")
+        for low, high, label in brackets:
+            count = len([a for a in all_non_zero if low <= a < high])
+            if count > 0:
+                add(f"| {label} | {count}件 |")
+        add()
+
+    # =============================================
+    # 3. 成約までのアクティビティ分析
+    # =============================================
+    add("---")
+    add()
+    add("## 3. 成約までのアクティビティ分析")
     add()
 
     if results["won_activities"]:
@@ -619,79 +755,38 @@ def generate_report(results, owner_name, period_str, start_date, end_date):
         add(f"| {label} | {total_act}件 | {avg_act:.1f}件 |")
     add()
 
-    if results["won"]:
-        add("### 成約案件のアクティビティ詳細（上位5件）")
-        add()
-        add("| 案件名 | 金額 | リードタイム | アクティビティ数 |")
-        add("|---|---|---|---|")
-        sorted_won = sorted(results["won"], key=lambda d: d["amount"], reverse=True)[:5]
-        for d in sorted_won:
-            lt = f"{d.get('lead_time', '-')}日" if d.get("lead_time") is not None else "-"
-            add(f"| {d['name']} | ¥{d['amount']:,.0f} | {lt} | {d['total_activities']}件 |")
-        add()
-
-    # 3. 取引金額分析
-    add("---")
-    add()
-    add("## 3. 取引金額分析")
-    add()
-
-    non_zero = [a for a in results["amounts"] if a > 0]
-    if non_zero:
-        add("### 金額帯別の取引分布")
-        add()
-        brackets = [
-            (0, 100000, "~¥100,000"),
-            (100000, 500000, "¥100,000~¥500,000"),
-            (500000, 1000000, "¥500,000~¥1,000,000"),
-            (1000000, 5000000, "¥1,000,000~¥5,000,000"),
-            (5000000, 10000000, "¥5,000,000~¥10,000,000"),
-            (10000000, float("inf"), "¥10,000,000~"),
-        ]
-        add("| 金額帯 | 件数 |")
-        add("|---|---|")
-        for low, high, label in brackets:
-            count = len([a for a in non_zero if low <= a < high])
-            if count > 0:
-                add(f"| {label} | {count}件 |")
-        add()
-
-    if results["monthly_pipeline"]:
-        add("### 月別の取引金額推移")
-        add()
-        add("| 月 | 新規件数 | 新規金額 |")
-        add("|---|---|---|")
-        for month in sorted(results["monthly_pipeline"].keys()):
-            data = results["monthly_pipeline"][month]
-            add(f"| {month} | {data['count']}件 | ¥{data['amount']:,.0f} |")
-        add()
-
-    # 4. 業界別分析
+    # =============================================
+    # 4. 業界・業種別分析
+    # =============================================
     add("---")
     add()
     add("## 4. 業界・業種別分析")
     add()
 
     if results["industries"]:
-        add("| 業界 | 取引数 | 成約数 | 失注数 | 成約率 | 合計金額 |")
-        add("|---|---|---|---|---|---|")
+        add("| 業界 | 取引数 | 成約数 | 失注数 | 進行中 | 成約率 | 成約金額 | パイプライン総額 |")
+        add("|---|---|---|---|---|---|---|---|")
         sorted_industries = sorted(
             results["industries"].items(),
-            key=lambda x: x[1]["amount"],
+            key=lambda x: x[1]["amount_won"],
             reverse=True,
         )
         for industry, data in sorted_industries:
             decided_ind = data["won"] + data["lost"]
             rate = (data["won"] / decided_ind * 100) if decided_ind > 0 else 0
+            open_ind = data["total"] - data["won"] - data["lost"]
             add(
-                f"| {industry} | {data['total']}件 | {data['won']}件 | {data['lost']}件 | {rate:.0f}% | ¥{data['amount']:,.0f} |"
+                f"| {industry} | {data['total']}件 | {data['won']}件 | {data['lost']}件 | {open_ind}件"
+                f" | {rate:.0f}% | ¥{data['amount_won']:,.0f} | ¥{data['amount_total']:,.0f} |"
             )
         add()
     else:
         add("（関連する会社データがありません）")
         add()
 
+    # =============================================
     # 5. 成約/失注理由分析
+    # =============================================
     add("---")
     add()
     add("## 5. 成約/失注理由分析")
@@ -721,33 +816,25 @@ def generate_report(results, owner_name, period_str, start_date, end_date):
         add("（失注案件なし）")
         add()
 
-    # 6. パイプライン推移
-    add("---")
-    add()
-    add("## 6. パイプライン推移")
-    add()
-
-    if results["monthly_pipeline"]:
-        add("| 月 | 新規パイプライン数 | 新規パイプライン金額 | 累積件数 | 累積金額 |")
-        add("|---|---|---|---|---|")
-        cumulative_count = 0
-        cumulative_amount = 0
-        for month in sorted(results["monthly_pipeline"].keys()):
-            data = results["monthly_pipeline"][month]
-            cumulative_count += data["count"]
-            cumulative_amount += data["amount"]
-            add(
-                f"| {month} | {data['count']}件 | ¥{data['amount']:,.0f} | {cumulative_count}件 | ¥{cumulative_amount:,.0f} |"
-            )
+    # 失注案件一覧（金額上位5件）
+    if results["lost"]:
+        add("### 失注案件（金額上位5件）")
         add()
-    else:
-        add("（データなし）")
+        add("| 案件名 | 金額 | リードタイム | 失注理由 |")
+        add("|---|---|---|---|")
+        sorted_lost = sorted(results["lost"], key=lambda d: d["amount"], reverse=True)[:5]
+        for d in sorted_lost:
+            lt = f"{d.get('lead_time', '-')}日" if d.get("lead_time") is not None else "-"
+            # find reason from deal properties
+            add(f"| {d['name']} | ¥{d['amount']:,.0f} | {lt} | - |")
         add()
 
-    # 7. ハイライト
+    # =============================================
+    # 6. ハイライト
+    # =============================================
     add("---")
     add()
-    add("## 7. ハイライト")
+    add("## 6. ハイライト")
     add()
     if results["highlights"]:
         for h in results["highlights"]:
@@ -767,12 +854,27 @@ def generate_report(results, owner_name, period_str, start_date, end_date):
                     best_industry = ind
         if best_industry:
             add(f"- 成約率が高い業界: **{best_industry}** ({best_rate*100:.0f}%)")
+
+    # パイプライン成長のハイライト
+    if results["monthly_pipeline"]:
+        months = sorted(results["monthly_pipeline"].keys())
+        if len(months) >= 2:
+            last = results["monthly_pipeline"][months[-1]]
+            prev = results["monthly_pipeline"][months[-2]]
+            if prev["count"] > 0:
+                growth = ((last["count"] - prev["count"]) / prev["count"]) * 100
+                if growth > 0:
+                    add(f"- パイプライン件数: {months[-2]}→{months[-1]}で **+{growth:.0f}%** 増加")
+                elif growth < 0:
+                    add(f"- パイプライン件数: {months[-2]}→{months[-1]}で **{growth:.0f}%** 減少")
     add()
 
-    # 8. ローライト
+    # =============================================
+    # 7. ローライト
+    # =============================================
     add("---")
     add()
-    add("## 8. ローライト")
+    add("## 7. ローライト")
     add()
     if results["lowlights"]:
         for ll in results["lowlights"]:

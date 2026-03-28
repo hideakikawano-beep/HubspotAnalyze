@@ -267,6 +267,11 @@ def parse_args():
         action="store_true",
         help="取引名から会社名を抽出してリスト表示",
     )
+    parser.add_argument(
+        "--skip-activities",
+        action="store_true",
+        help="アクティビティ取得をスキップ（高速化）",
+    )
     return parser.parse_args()
 
 
@@ -459,19 +464,39 @@ def fetch_associated_companies(client, deal_ids):
 
 
 def fetch_deal_activities(client, deal_ids):
-    """取引に関連するアクティビティ数を取得"""
+    """取引に関連するアクティビティ数を取得（最初の5件が全て0なら残りをスキップ）"""
     deal_activities = {}
     activity_object_types = ["notes", "emails", "calls", "meetings", "tasks"]
     total = len(deal_ids)
+    sample_size = min(5, total)
+    found_any = False
 
-    for i, deal_id in enumerate(deal_ids):
-        if (i + 1) % 20 == 0 or i + 1 == total:
-            print(f"  アクティビティ: {i + 1}/{total}件処理中...", flush=True)
+    # まず最初の数件をサンプリング
+    print(f"  アクティビティ: 最初の{sample_size}件をサンプリング中...", flush=True)
+    for i in range(sample_size):
+        deal_id = deal_ids[i]
         counts = {}
         for obj_type in activity_object_types:
             ids = _get_associations_v4(client, deal_id, obj_type)
             counts[obj_type] = len(ids)
         deal_activities[deal_id] = counts
+        if sum(counts.values()) > 0:
+            found_any = True
+
+    if not found_any:
+        print("  → サンプルが全て0件のため、残りをスキップします")
+        for deal_id in deal_ids[sample_size:]:
+            deal_activities[deal_id] = {t: 0 for t in activity_object_types}
+    else:
+        # アクティビティが存在する場合は残りも取得
+        for i, deal_id in enumerate(deal_ids[sample_size:], start=sample_size):
+            if (i + 1) % 20 == 0 or i + 1 == total:
+                print(f"  アクティビティ: {i + 1}/{total}件処理中...", flush=True)
+            counts = {}
+            for obj_type in activity_object_types:
+                ids = _get_associations_v4(client, deal_id, obj_type)
+                counts[obj_type] = len(ids)
+            deal_activities[deal_id] = counts
 
     total_acts = sum(sum(c.values()) for c in deal_activities.values())
     print(f"アクティビティ: 合計{total_acts}件を取得")
@@ -1053,8 +1078,12 @@ def main():
     if not deal_companies:
         print("  → 関連会社が0件のため、取引名から会社名を抽出します...")
 
-    print("アクティビティデータを取得中...")
-    deal_activities = fetch_deal_activities(client, deal_ids)
+    if args.skip_activities:
+        print("アクティビティ取得をスキップ（--skip-activities）")
+        deal_activities = {did: {"notes": 0, "emails": 0, "calls": 0, "meetings": 0, "tasks": 0} for did in deal_ids}
+    else:
+        print("アクティビティデータを取得中...")
+        deal_activities = fetch_deal_activities(client, deal_ids)
 
     print("データを分析中...")
     analysis = analyze_data(deals, stage_map, deal_companies, deal_activities)

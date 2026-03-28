@@ -247,6 +247,12 @@ def parse_args():
         help="分析期間: all, 1y, 6m, quarter, or YYYY-MM-DD:YYYY-MM-DD",
     )
     parser.add_argument(
+        "--date-field",
+        default="both",
+        choices=["createdate", "closedate", "both"],
+        help="期間フィルタの基準日: createdate(作成日), closedate(成約/失注日), both(両方を含む, デフォルト)",
+    )
+    parser.add_argument(
         "--owner",
         default="Hideaki Kawano",
         help="対象オーナー名 (部分一致)",
@@ -311,35 +317,12 @@ def find_owner(client, owner_name):
     sys.exit(1)
 
 
-def fetch_deals(client, owner_id, start_date, end_date):
-    """取引を検索して取得"""
-    filters = [
-        Filter(property_name="hubspot_owner_id", operator="EQ", value=owner_id)
-    ]
-
-    if start_date:
-        filters.append(
-            Filter(
-                property_name="createdate",
-                operator="GTE",
-                value=str(int(start_date.timestamp() * 1000)),
-            )
-        )
-    if end_date:
-        filters.append(
-            Filter(
-                property_name="createdate",
-                operator="LTE",
-                value=str(int(end_date.timestamp() * 1000)),
-            )
-        )
-
+def _search_deals(client, filter_groups, after=None):
+    """HubSpot Search APIで取引を検索（ページング対応）"""
     all_deals = []
-    after = None
-
     while True:
         search_request = PublicObjectSearchRequest(
-            filter_groups=[FilterGroup(filters=filters)],
+            filter_groups=filter_groups,
             properties=DEAL_PROPERTIES,
             limit=100,
             after=after or "0",
@@ -352,9 +335,63 @@ def fetch_deals(client, owner_id, start_date, end_date):
             after = response.paging.next.after
         else:
             break
-
-    print(f"取引数: {len(all_deals)}件を取得")
     return all_deals
+
+
+def fetch_deals(client, owner_id, start_date, end_date, date_field="both"):
+    """取引を検索して取得
+    date_field: 'createdate', 'closedate', or 'both'
+    'both' = 作成日が期間内 OR 成約/失注日が期間内 の両方を取得（重複排除）
+    """
+    owner_filter = Filter(property_name="hubspot_owner_id", operator="EQ", value=owner_id)
+
+    if not start_date:
+        # 全期間の場合
+        results = _search_deals(client, [FilterGroup(filters=[owner_filter])])
+        print(f"取引数: {len(results)}件を取得")
+        return results
+
+    start_ms = str(int(start_date.timestamp() * 1000))
+    end_ms = str(int(end_date.timestamp() * 1000))
+
+    if date_field == "both":
+        # 作成日ベースで検索
+        create_filters = [
+            owner_filter,
+            Filter(property_name="createdate", operator="GTE", value=start_ms),
+            Filter(property_name="createdate", operator="LTE", value=end_ms),
+        ]
+        # 成約/失注日ベースで検索
+        close_filters = [
+            owner_filter,
+            Filter(property_name="closedate", operator="GTE", value=start_ms),
+            Filter(property_name="closedate", operator="LTE", value=end_ms),
+        ]
+        print("  作成日ベースで検索中...")
+        deals_by_create = _search_deals(client, [FilterGroup(filters=create_filters)])
+        print(f"  → {len(deals_by_create)}件")
+        print("  成約/失注日ベースで検索中...")
+        deals_by_close = _search_deals(client, [FilterGroup(filters=close_filters)])
+        print(f"  → {len(deals_by_close)}件")
+
+        # 重複排除してマージ
+        seen_ids = set()
+        all_deals = []
+        for deal in deals_by_create + deals_by_close:
+            if deal.id not in seen_ids:
+                seen_ids.add(deal.id)
+                all_deals.append(deal)
+        print(f"取引数: {len(all_deals)}件を取得（重複排除後）")
+        return all_deals
+    else:
+        filters = [
+            owner_filter,
+            Filter(property_name=date_field, operator="GTE", value=start_ms),
+            Filter(property_name=date_field, operator="LTE", value=end_ms),
+        ]
+        results = _search_deals(client, [FilterGroup(filters=filters)])
+        print(f"取引数: {len(results)}件を取得")
+        return results
 
 
 def fetch_pipeline_stages(client):
@@ -986,8 +1023,8 @@ def main():
     print("パイプライン情報を取得中...")
     stage_map, pipeline_map = fetch_pipeline_stages(client)
 
-    print("取引データを取得中...")
-    deals = fetch_deals(client, owner_id, start_date, end_date)
+    print(f"取引データを取得中...（フィルタ: {args.date_field}）")
+    deals = fetch_deals(client, owner_id, start_date, end_date, date_field=args.date_field)
 
     if not deals:
         print("取引が見つかりませんでした。")

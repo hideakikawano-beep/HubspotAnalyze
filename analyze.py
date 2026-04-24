@@ -282,7 +282,12 @@ def parse_args():
     parser.add_argument(
         "--deal-type",
         default=None,
-        help="取引タイプで絞り込み（例: 新規MRR）。未指定時は全タイプ",
+        help="取引タイプ(dealtype)の内部値で絞り込み（例: newbusiness）。未指定時は全タイプ",
+    )
+    parser.add_argument(
+        "--list-deal-types",
+        action="store_true",
+        help="オーナーの全取引から dealtype の内部値一覧を表示して終了（内部値確認用）",
     )
     return parser.parse_args()
 
@@ -1437,6 +1442,21 @@ def main():
     print("パイプライン情報を取得中...")
     stage_map, pipeline_map = fetch_pipeline_stages(client)
 
+    # --list-deal-types モード: オーナーの全取引から dealtype の内部値一覧を表示
+    if args.list_deal_types:
+        print("dealtype 一覧取得のためオーナーの全取引を取得中...")
+        all_deals = fetch_deals(client, owner_id, None, None)
+        from collections import Counter
+        counts = Counter(
+            (d.properties.get("dealtype") or "(未設定)")
+            for d in all_deals
+        )
+        print(f"\n=== dealtype の内部値一覧（{len(all_deals)}件中）===")
+        for value, count in counts.most_common():
+            print(f"  {value}: {count}件")
+        print("\n絞り込みには --deal-type <内部値> を使ってください。")
+        sys.exit(0)
+
     type_label = f"、取引タイプ: {args.deal_type}" if args.deal_type else ""
     print(f"取引データを取得中...（フィルタ: {args.date_field}{type_label}）")
     deals = fetch_deals(
@@ -1447,6 +1467,9 @@ def main():
 
     if not deals:
         print("取引が見つかりませんでした。")
+        if args.deal_type:
+            print(f"ヒント: --deal-type='{args.deal_type}' は内部値で一致していない可能性があります。")
+            print("  `python analyze.py --list-deal-types` で実際の内部値を確認してください。")
         sys.exit(0)
 
     # --list-companies モード: 取引名から会社名を抽出して一覧表示

@@ -272,6 +272,11 @@ def parse_args():
         action="store_true",
         help="アクティビティ取得をスキップ（高速化）",
     )
+    parser.add_argument(
+        "--fiscal-quarters",
+        action="store_true",
+        help="FY25 Q4〜FY26 Q4 の四半期別セクションで1本のレポートを生成",
+    )
     return parser.parse_args()
 
 
@@ -300,6 +305,92 @@ def get_date_range(period_str):
         sys.exit(1)
 
     return start_date, end_date
+
+
+FISCAL_QUARTERS = [
+    ("FY25 Q4", datetime(2025, 11, 1), datetime(2025, 12, 31, 23, 59, 59)),
+    ("FY26 Q1", datetime(2026, 1, 1), datetime(2026, 3, 31, 23, 59, 59)),
+    ("FY26 Q2", datetime(2026, 4, 1), datetime(2026, 6, 30, 23, 59, 59)),
+    ("FY26 Q3", datetime(2026, 7, 1), datetime(2026, 9, 30, 23, 59, 59)),
+    ("FY26 Q4", datetime(2026, 10, 1), datetime(2026, 12, 31, 23, 59, 59)),
+]
+
+FISCAL_RANGE_START = FISCAL_QUARTERS[0][1]
+FISCAL_RANGE_END = FISCAL_QUARTERS[-1][2]
+
+
+def _parse_hubspot_datetime(value):
+    """HubSpot の日付プロパティ (ISO-8601 文字列 or ms数値) を naive datetime に変換"""
+    if value is None or value == "":
+        return None
+    # ISO-8601 文字列（HubSpot SDK の通常の返却形式）
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            # 数値文字列の場合のフォールバック
+            try:
+                return datetime.fromtimestamp(int(value) / 1000)
+            except (ValueError, TypeError):
+                return None
+        # tz-aware を naive に揃える（既存ロジックと一致させる）
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    # 数値の場合（ms）
+    try:
+        return datetime.fromtimestamp(int(value) / 1000)
+    except (ValueError, TypeError):
+        return None
+
+
+def _in_range(value, q_start, q_end):
+    dt = _parse_hubspot_datetime(value)
+    if dt is None:
+        return False
+    return q_start <= dt <= q_end
+
+
+def filter_deals_for_quarter(deals, q_start, q_end):
+    """createdate または closedate が [q_start, q_end] に入る取引を返す"""
+    return [
+        d for d in deals
+        if _in_range(d.properties.get("createdate"), q_start, q_end)
+        or _in_range(d.properties.get("closedate"), q_start, q_end)
+    ]
+
+
+def pipeline_in_quarter(deals, stage_map, deal_companies, q_start, q_end):
+    """未来四半期向け: closedate が該当期間のオープン案件のみ抽出し集計"""
+    items = []
+    for d in deals:
+        if not _in_range(d.properties.get("closedate"), q_start, q_end):
+            continue
+        stage_id = d.properties.get("dealstage", "")
+        stage_info = stage_map.get(stage_id, {})
+        if classify_deal(stage_info) != "open":
+            continue
+        try:
+            amount = float(d.properties.get("amount") or 0)
+        except (ValueError, TypeError):
+            amount = 0.0
+
+        companies = deal_companies.get(d.id, [])
+        if companies:
+            company_name = (companies[0].properties.get("name") or "-").strip() or "-"
+        else:
+            company_name = extract_company_from_dealname(d.properties.get("dealname", "")) or "-"
+
+        items.append({
+            "id": d.id,
+            "name": d.properties.get("dealname", "不明"),
+            "amount": amount,
+            "closedate": d.properties.get("closedate"),
+            "stage": stage_info.get("label", stage_id),
+            "company": company_name,
+        })
+    total_amount = sum(it["amount"] for it in items)
+    return {"deals": items, "count": len(items), "amount": total_amount}
 
 
 def find_owner(client, owner_name):
@@ -1025,6 +1116,266 @@ def generate_report(results, owner_name, period_str, start_date, end_date):
     return "\n".join(lines)
 
 
+def _quarter_summary_row(label, status_label, results):
+    """四半期サマリー表の1行を生成（過去/現在向け）"""
+    won_count = len(results["won"])
+    lost_count = len(results["lost"])
+    open_count = len(results["open"])
+    decided = won_count + lost_count
+    win_rate = (won_count / decided * 100) if decided > 0 else 0
+    avg_lead = (sum(results["lead_times"]) / len(results["lead_times"])) if results["lead_times"] else 0
+    total_won = sum(results["won_amounts"])
+    total_lost = sum(results["lost_amounts"])
+    total_open = sum(results["open_amounts"])
+    return (
+        f"| {label} | {status_label} | {results['total']}件"
+        f" | {won_count}件 | ¥{total_won:,.0f}"
+        f" | {lost_count}件 | ¥{total_lost:,.0f}"
+        f" | {open_count}件 | ¥{total_open:,.0f}"
+        f" | {win_rate:.0f}% | {avg_lead:.0f}日 |"
+    )
+
+
+def _future_summary_row(label, pipeline):
+    """四半期サマリー表の1行を生成（未来向け: パイプラインのみ）"""
+    return (
+        f"| {label} | 未来（予定） | - "
+        f"| - | -"
+        f" | - | -"
+        f" | {pipeline['count']}件 | ¥{pipeline['amount']:,.0f}"
+        f" | - | - |"
+    )
+
+
+def _render_quarter_detail(label, start, end, results):
+    """過去/現在四半期の詳細セクションを生成"""
+    out = []
+    won_count = len(results["won"])
+    lost_count = len(results["lost"])
+    open_count = len(results["open"])
+    decided = won_count + lost_count
+    win_rate = (won_count / decided * 100) if decided > 0 else 0
+    avg_won = (sum(results["won_amounts"]) / won_count) if won_count > 0 else 0
+    avg_lead = (sum(results["lead_times"]) / len(results["lead_times"])) if results["lead_times"] else 0
+    total_won = sum(results["won_amounts"])
+    total_lost = sum(results["lost_amounts"])
+    total_open = sum(results["open_amounts"])
+    total_amount = sum(results["amounts"])
+
+    out.append("---")
+    out.append("")
+    out.append(f"## {label} ({start.strftime('%Y/%m/%d')} 〜 {end.strftime('%Y/%m/%d')})")
+    out.append("")
+    out.append("### 主要指標")
+    out.append("")
+    out.append("| 指標 | 値 |")
+    out.append("|---|---|")
+    out.append(f"| 期間内の取引数 | {results['total']}件 |")
+    out.append(f"| 成約数 | {won_count}件 |")
+    out.append(f"| 成約合計金額 | ¥{total_won:,.0f} |")
+    out.append(f"| 平均成約額 | ¥{avg_won:,.0f} |")
+    out.append(f"| 失注数 | {lost_count}件（¥{total_lost:,.0f}） |")
+    out.append(f"| 進行中（オープン） | {open_count}件（¥{total_open:,.0f}） |")
+    out.append(f"| パイプライン総額 | ¥{total_amount:,.0f} |")
+    out.append(f"| 成約率 | {win_rate:.1f}%（{won_count}/{decided}件） |")
+    out.append(f"| 平均リードタイム | {avg_lead:.1f}日 |")
+    out.append("")
+
+    # 月別推移（この四半期内の月のみ）
+    months = sorted(set(
+        list(results["monthly_pipeline"].keys())
+        + list(results["monthly_won"].keys())
+        + list(results["monthly_lost"].keys())
+    ))
+    if months:
+        out.append("### 月別推移")
+        out.append("")
+        out.append("| 月 | 新規PL件数 | 新規PL金額 | 成約件数 | 成約金額 | 失注件数 | 失注金額 |")
+        out.append("|---|---|---|---|---|---|---|")
+        for month in months:
+            pl = results["monthly_pipeline"].get(month, {"count": 0, "amount": 0})
+            wo = results["monthly_won"].get(month, {"count": 0, "amount": 0})
+            lo = results["monthly_lost"].get(month, {"count": 0, "amount": 0})
+            out.append(
+                f"| {month} | {pl['count']}件 | ¥{pl['amount']:,.0f}"
+                f" | {wo['count']}件 | ¥{wo['amount']:,.0f}"
+                f" | {lo['count']}件 | ¥{lo['amount']:,.0f} |"
+            )
+        out.append("")
+
+    # 成約案件トップ5
+    if results["won"]:
+        out.append("### 成約案件（金額上位5件）")
+        out.append("")
+        out.append("| 案件名 | 金額 | リードタイム |")
+        out.append("|---|---|---|")
+        for d in sorted(results["won"], key=lambda d: d["amount"], reverse=True)[:5]:
+            lt = f"{d.get('lead_time', '-')}日" if d.get("lead_time") is not None else "-"
+            out.append(f"| {d['name']} | ¥{d['amount']:,.0f} | {lt} |")
+        out.append("")
+
+    # 失注案件トップ5
+    if results["lost"]:
+        out.append("### 失注案件（金額上位5件）")
+        out.append("")
+        out.append("| 案件名 | 金額 | リードタイム |")
+        out.append("|---|---|---|")
+        for d in sorted(results["lost"], key=lambda d: d["amount"], reverse=True)[:5]:
+            lt = f"{d.get('lead_time', '-')}日" if d.get("lead_time") is not None else "-"
+            out.append(f"| {d['name']} | ¥{d['amount']:,.0f} | {lt} |")
+        out.append("")
+
+    # 業界別
+    if results["industries"]:
+        out.append("### 業界別")
+        out.append("")
+        out.append("| 業界 | 取引数 | 成約 | 失注 | 進行中 | 成約率 | 成約金額 |")
+        out.append("|---|---|---|---|---|---|---|")
+        sorted_ind = sorted(
+            results["industries"].items(),
+            key=lambda x: x[1]["amount_won"],
+            reverse=True,
+        )
+        for industry, data in sorted_ind:
+            decided_ind = data["won"] + data["lost"]
+            rate = (data["won"] / decided_ind * 100) if decided_ind > 0 else 0
+            open_ind = data["total"] - data["won"] - data["lost"]
+            out.append(
+                f"| {industry} | {data['total']}件 | {data['won']}件"
+                f" | {data['lost']}件 | {open_ind}件"
+                f" | {rate:.0f}% | ¥{data['amount_won']:,.0f} |"
+            )
+        out.append("")
+
+    return out
+
+
+def _render_future_quarter(label, start, end, pipeline):
+    """未来四半期のセクション（予定パイプラインのみ）"""
+    out = []
+    out.append("---")
+    out.append("")
+    out.append(f"## {label} ({start.strftime('%Y/%m/%d')} 〜 {end.strftime('%Y/%m/%d')}) — 予定パイプライン")
+    out.append("")
+    out.append(f"**該当期間に成約予定のオープン案件: {pipeline['count']}件 / 合計 ¥{pipeline['amount']:,.0f}**")
+    out.append("")
+
+    if pipeline["deals"]:
+        out.append("| 案件名 | 会社 | 金額 | 予定クローズ日 | ステージ |")
+        out.append("|---|---|---|---|---|")
+        for d in sorted(pipeline["deals"], key=lambda x: x["amount"], reverse=True):
+            close_short = "-"
+            if d.get("closedate"):
+                try:
+                    close_short = datetime.fromisoformat(
+                        d["closedate"].replace("Z", "+00:00")
+                    ).strftime("%Y/%m/%d")
+                except (ValueError, TypeError):
+                    close_short = d["closedate"]
+            out.append(
+                f"| {d['name']} | {d['company']} | ¥{d['amount']:,.0f}"
+                f" | {close_short} | {d['stage']} |"
+            )
+        out.append("")
+    else:
+        out.append("（該当案件なし）")
+        out.append("")
+
+    return out
+
+
+def generate_quarterly_report(per_quarter, overall_results, owner_name):
+    """会計四半期別の統合レポートを生成"""
+    now = datetime.now()
+    lines = []
+
+    def add(text=""):
+        lines.append(text)
+
+    add("# HubSpot 営業実績分析レポート（四半期別）")
+    add()
+    add("## 概要")
+    add()
+    add(f"- **対象**: {owner_name}")
+    add(f"- **期間**: {FISCAL_RANGE_START.strftime('%Y/%m/%d')} 〜 {FISCAL_RANGE_END.strftime('%Y/%m/%d')}")
+    add(f"- **生成日**: {now.strftime('%Y/%m/%d %H:%M')}")
+    add()
+
+    # ================================
+    # 四半期サマリー表
+    # ================================
+    add("---")
+    add()
+    add("## 四半期サマリー")
+    add()
+    add("| 四半期 | 状態 | 取引数 | 成約数 | 成約金額 | 失注数 | 失注金額 | パイプライン数 | パイプライン金額 | 成約率 | 平均LT |")
+    add("|---|---|---|---|---|---|---|---|---|---|---|")
+    for entry in per_quarter:
+        label = entry["label"]
+        if entry["kind"] == "future":
+            add(_future_summary_row(label, entry["pipeline"]))
+        else:
+            status_label = "期中" if entry["kind"] == "current" else "完了"
+            add(_quarter_summary_row(label, status_label, entry["results"]))
+    add()
+    add(
+        "*注: 取引数・成約系列は createdate または closedate が当該四半期内の取引を計上しています。"
+        "四半期をまたぐ案件は複数四半期に計上される場合があります。未来四半期は closedate 予定のオープン案件のみ表示しています。*"
+    )
+    add()
+
+    # ================================
+    # 四半期別詳細
+    # ================================
+    for entry in per_quarter:
+        if entry["kind"] == "future":
+            lines.extend(_render_future_quarter(
+                entry["label"], entry["start"], entry["end"], entry["pipeline"]
+            ))
+        else:
+            lines.extend(_render_quarter_detail(
+                entry["label"], entry["start"], entry["end"], entry["results"]
+            ))
+
+    # ================================
+    # 全期間サマリー
+    # ================================
+    won_count = len(overall_results["won"])
+    lost_count = len(overall_results["lost"])
+    open_count = len(overall_results["open"])
+    decided = won_count + lost_count
+    win_rate = (won_count / decided * 100) if decided > 0 else 0
+    avg_lead = (
+        sum(overall_results["lead_times"]) / len(overall_results["lead_times"])
+        if overall_results["lead_times"] else 0
+    )
+    total_won = sum(overall_results["won_amounts"])
+    total_lost = sum(overall_results["lost_amounts"])
+    total_open = sum(overall_results["open_amounts"])
+    total_amount = sum(overall_results["amounts"])
+
+    add("---")
+    add()
+    add(f"## 全期間サマリー ({FISCAL_RANGE_START.strftime('%Y/%m/%d')} 〜 {FISCAL_RANGE_END.strftime('%Y/%m/%d')})")
+    add()
+    add("| 指標 | 値 |")
+    add("|---|---|")
+    add(f"| 取引総数 | {overall_results['total']}件 |")
+    add(f"| 成約数 | {won_count}件 |")
+    add(f"| 成約合計金額 | ¥{total_won:,.0f} |")
+    add(f"| 失注数 | {lost_count}件（¥{total_lost:,.0f}） |")
+    add(f"| 進行中（オープン） | {open_count}件（¥{total_open:,.0f}） |")
+    add(f"| パイプライン総額 | ¥{total_amount:,.0f} |")
+    add(f"| 成約率 | {win_rate:.1f}%（{won_count}/{decided}件） |")
+    add(f"| 平均リードタイム | {avg_lead:.1f}日 |")
+    add()
+
+    add("---")
+    add(f"*レポート生成: {now.strftime('%Y/%m/%d %H:%M')}*")
+
+    return "\n".join(lines)
+
+
 def main():
     args = parse_args()
 
@@ -1039,11 +1390,19 @@ def main():
 
     owner_id, owner_name = find_owner(client, args.owner)
 
-    start_date, end_date = get_date_range(args.period)
-    if start_date:
-        print(f"期間: {start_date.strftime('%Y/%m/%d')} - {end_date.strftime('%Y/%m/%d')}")
+    if args.fiscal_quarters:
+        start_date = FISCAL_RANGE_START
+        end_date = FISCAL_RANGE_END
+        print(
+            f"四半期別モード: {start_date.strftime('%Y/%m/%d')} 〜 {end_date.strftime('%Y/%m/%d')}"
+            f"（{len(FISCAL_QUARTERS)}四半期）"
+        )
     else:
-        print("期間: 全期間")
+        start_date, end_date = get_date_range(args.period)
+        if start_date:
+            print(f"期間: {start_date.strftime('%Y/%m/%d')} - {end_date.strftime('%Y/%m/%d')}")
+        else:
+            print("期間: 全期間")
 
     print("パイプライン情報を取得中...")
     stage_map, pipeline_map = fetch_pipeline_stages(client)
@@ -1088,10 +1447,42 @@ def main():
     print("データを分析中...")
     analysis = analyze_data(deals, stage_map, deal_companies, deal_activities)
 
-    print("レポートを生成中...")
-    report = generate_report(analysis, owner_name, args.period, start_date, end_date)
+    if args.fiscal_quarters:
+        print("四半期別レポートを生成中...")
+        now = datetime.now()
+        per_quarter = []
+        for label, q_start, q_end in FISCAL_QUARTERS:
+            if q_start > now:
+                pipeline = pipeline_in_quarter(deals, stage_map, deal_companies, q_start, q_end)
+                per_quarter.append({
+                    "label": label,
+                    "kind": "future",
+                    "start": q_start,
+                    "end": q_end,
+                    "pipeline": pipeline,
+                })
+                print(f"  {label}: 未来四半期 — 予定パイプライン {pipeline['count']}件 / ¥{pipeline['amount']:,.0f}")
+            else:
+                subset = filter_deals_for_quarter(deals, q_start, q_end)
+                q_results = analyze_data(subset, stage_map, deal_companies, deal_activities)
+                kind = "current" if q_end >= now else "past"
+                per_quarter.append({
+                    "label": label,
+                    "kind": kind,
+                    "start": q_start,
+                    "end": q_end,
+                    "results": q_results,
+                })
+                print(f"  {label}: {len(subset)}件を分析")
 
-    output_path = args.output or f"reports/sales_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        report = generate_quarterly_report(per_quarter, analysis, owner_name)
+        default_name = f"reports/sales_report_FY25Q4-FY26Q4_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    else:
+        print("レポートを生成中...")
+        report = generate_report(analysis, owner_name, args.period, start_date, end_date)
+        default_name = f"reports/sales_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+
+    output_path = args.output or default_name
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(report)

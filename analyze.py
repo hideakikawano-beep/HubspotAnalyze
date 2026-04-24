@@ -31,6 +31,7 @@ DEAL_PROPERTIES = [
     "hubspot_owner_id",
     "hs_deal_stage_probability",
     "started_day",
+    "dealtype",
 ]
 
 COMPANY_PROPERTIES = ["name", "industry", "type", "domain"]
@@ -278,6 +279,11 @@ def parse_args():
         action="store_true",
         help="FY25 Q4〜FY26 Q4 の四半期別セクションで1本のレポートを生成",
     )
+    parser.add_argument(
+        "--deal-type",
+        default=None,
+        help="取引タイプで絞り込み（例: 新規MRR）。未指定時は全タイプ",
+    )
     return parser.parse_args()
 
 
@@ -440,16 +446,19 @@ def _search_deals(client, filter_groups, after=None):
     return all_deals
 
 
-def fetch_deals(client, owner_id, start_date, end_date, date_field="both"):
+def fetch_deals(client, owner_id, start_date, end_date, date_field="both", deal_type=None):
     """取引を検索して取得
     date_field: 'createdate', 'closedate', or 'both'
     'both' = 作成日が期間内 OR 成約/失注日が期間内 の両方を取得（重複排除）
+    deal_type: 指定時は dealtype プロパティが一致する取引のみ取得（例: "新規MRR"）
     """
-    owner_filter = Filter(property_name="hubspot_owner_id", operator="EQ", value=owner_id)
+    base_filters = [Filter(property_name="hubspot_owner_id", operator="EQ", value=owner_id)]
+    if deal_type:
+        base_filters.append(Filter(property_name="dealtype", operator="EQ", value=deal_type))
 
     if not start_date:
         # 全期間の場合
-        results = _search_deals(client, [FilterGroup(filters=[owner_filter])])
+        results = _search_deals(client, [FilterGroup(filters=base_filters)])
         print(f"取引数: {len(results)}件を取得")
         return results
 
@@ -458,14 +467,12 @@ def fetch_deals(client, owner_id, start_date, end_date, date_field="both"):
 
     if date_field == "both":
         # 作成日ベースで検索
-        create_filters = [
-            owner_filter,
+        create_filters = base_filters + [
             Filter(property_name="createdate", operator="GTE", value=start_ms),
             Filter(property_name="createdate", operator="LTE", value=end_ms),
         ]
         # 成約/失注日ベースで検索
-        close_filters = [
-            owner_filter,
+        close_filters = base_filters + [
             Filter(property_name="closedate", operator="GTE", value=start_ms),
             Filter(property_name="closedate", operator="LTE", value=end_ms),
         ]
@@ -486,8 +493,7 @@ def fetch_deals(client, owner_id, start_date, end_date, date_field="both"):
         print(f"取引数: {len(all_deals)}件を取得（重複排除後）")
         return all_deals
     else:
-        filters = [
-            owner_filter,
+        filters = base_filters + [
             Filter(property_name=date_field, operator="GTE", value=start_ms),
             Filter(property_name=date_field, operator="LTE", value=end_ms),
         ]
@@ -1431,8 +1437,13 @@ def main():
     print("パイプライン情報を取得中...")
     stage_map, pipeline_map = fetch_pipeline_stages(client)
 
-    print(f"取引データを取得中...（フィルタ: {args.date_field}）")
-    deals = fetch_deals(client, owner_id, start_date, end_date, date_field=args.date_field)
+    type_label = f"、取引タイプ: {args.deal_type}" if args.deal_type else ""
+    print(f"取引データを取得中...（フィルタ: {args.date_field}{type_label}）")
+    deals = fetch_deals(
+        client, owner_id, start_date, end_date,
+        date_field=args.date_field,
+        deal_type=args.deal_type,
+    )
 
     if not deals:
         print("取引が見つかりませんでした。")

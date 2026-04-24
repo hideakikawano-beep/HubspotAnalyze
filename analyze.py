@@ -30,6 +30,7 @@ DEAL_PROPERTIES = [
     "closed_won_reason",
     "hubspot_owner_id",
     "hs_deal_stage_probability",
+    "started_day",
 ]
 
 COMPANY_PROPERTIES = ["name", "industry", "type", "domain"]
@@ -351,20 +352,25 @@ def _in_range(value, q_start, q_end):
     return q_start <= dt <= q_end
 
 
+def _delivery_date(props):
+    """納品日(started_day) を優先し、無ければ closedate にフォールバック"""
+    return props.get("started_day") or props.get("closedate")
+
+
 def filter_deals_for_quarter(deals, q_start, q_end):
-    """createdate または closedate が [q_start, q_end] に入る取引を返す"""
+    """納品日(started_day; 無ければcloseate)が [q_start, q_end] に入る取引を返す"""
     return [
         d for d in deals
-        if _in_range(d.properties.get("createdate"), q_start, q_end)
-        or _in_range(d.properties.get("closedate"), q_start, q_end)
+        if _in_range(_delivery_date(d.properties), q_start, q_end)
     ]
 
 
 def pipeline_in_quarter(deals, stage_map, deal_companies, q_start, q_end):
-    """未来四半期向け: closedate が該当期間のオープン案件のみ抽出し集計"""
+    """未来四半期向け: 納品予定日(started_day; 無ければclosedate)が該当期間のオープン案件のみ抽出し集計"""
     items = []
     for d in deals:
-        if not _in_range(d.properties.get("closedate"), q_start, q_end):
+        delivery = _delivery_date(d.properties)
+        if not _in_range(delivery, q_start, q_end):
             continue
         stage_id = d.properties.get("dealstage", "")
         stage_info = stage_map.get(stage_id, {})
@@ -385,7 +391,7 @@ def pipeline_in_quarter(deals, stage_map, deal_companies, q_start, q_end):
             "id": d.id,
             "name": d.properties.get("dealname", "不明"),
             "amount": amount,
-            "closedate": d.properties.get("closedate"),
+            "delivery_date": delivery,
             "stage": stage_info.get("label", stage_id),
             "company": company_name,
         })
@@ -608,8 +614,13 @@ def classify_deal(stage_info):
     return "open"
 
 
-def analyze_data(deals, stage_map, deal_companies, deal_activities):
-    """データを分析してレポート用の構造化データを返す"""
+def analyze_data(deals, stage_map, deal_companies, deal_activities, monthly_date_field="closedate"):
+    """データを分析してレポート用の構造化データを返す
+
+    monthly_date_field: 月次集計(monthly_won/lost/pipeline)の基準日
+      - "closedate" (デフォルト): 従来どおり成約/失注日ベース
+      - "started_day": 納品日ベース(未設定時はclosedateにフォールバック)
+    """
     results = {
         "total": len(deals),
         "won": [],
@@ -659,20 +670,31 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
             "status": status,
         }
 
-        # 月別パイプライン（作成日ベース = 新規パイプライン）
+        # 月次集計の基準日
+        #  - closedate モード: monthly_pipeline=createdate, monthly_won/lost=closedate
+        #  - started_day モード: 全て 納品日(未設定時はclosedateにフォールバック)
         create_str = props.get("createdate")
-        if create_str:
+        close_str = props.get("closedate")
+
+        if monthly_date_field == "started_day":
+            pipeline_date_str = _delivery_date(props)
+            outcome_date_str = _delivery_date(props)
+        else:
+            pipeline_date_str = create_str
+            outcome_date_str = close_str
+
+        # 月別パイプライン
+        if pipeline_date_str:
             try:
-                create_dt = datetime.fromisoformat(create_str.replace("Z", "+00:00"))
-                month_key = create_dt.strftime("%Y-%m")
+                pl_dt = datetime.fromisoformat(pipeline_date_str.replace("Z", "+00:00"))
+                month_key = pl_dt.strftime("%Y-%m")
                 results["monthly_pipeline"][month_key]["count"] += 1
                 results["monthly_pipeline"][month_key]["amount"] += amount
             except (ValueError, TypeError):
                 pass
 
-        # リードタイム計算
+        # リードタイム計算(createdate→closedate)
         lead_time_days = None
-        close_str = props.get("closedate")
         if create_str and close_str:
             try:
                 create_dt = datetime.fromisoformat(create_str.replace("Z", "+00:00"))
@@ -683,17 +705,17 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
             except (ValueError, TypeError):
                 pass
 
-        # 月別成約・失注（成約/失注日ベース）
-        if close_str and status in ("won", "lost"):
+        # 月別成約・失注
+        if outcome_date_str and status in ("won", "lost"):
             try:
-                close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-                close_month = close_dt.strftime("%Y-%m")
+                outcome_dt = datetime.fromisoformat(outcome_date_str.replace("Z", "+00:00"))
+                outcome_month = outcome_dt.strftime("%Y-%m")
                 if status == "won":
-                    results["monthly_won"][close_month]["count"] += 1
-                    results["monthly_won"][close_month]["amount"] += amount
+                    results["monthly_won"][outcome_month]["count"] += 1
+                    results["monthly_won"][outcome_month]["amount"] += amount
                 else:
-                    results["monthly_lost"][close_month]["count"] += 1
-                    results["monthly_lost"][close_month]["amount"] += amount
+                    results["monthly_lost"][outcome_month]["count"] += 1
+                    results["monthly_lost"][outcome_month]["amount"] += amount
             except (ValueError, TypeError):
                 pass
 
@@ -1188,9 +1210,9 @@ def _render_quarter_detail(label, start, end, results):
         + list(results["monthly_lost"].keys())
     ))
     if months:
-        out.append("### 月別推移")
+        out.append("### 月別推移（納品日ベース）")
         out.append("")
-        out.append("| 月 | 新規PL件数 | 新規PL金額 | 成約件数 | 成約金額 | 失注件数 | 失注金額 |")
+        out.append("| 月 | 取引数 | 総額 | 成約件数 | 成約金額 | 失注件数 | 失注金額 |")
         out.append("|---|---|---|---|---|---|---|")
         for month in months:
             pl = results["monthly_pipeline"].get(month, {"count": 0, "amount": 0})
@@ -1261,20 +1283,20 @@ def _render_future_quarter(label, start, end, pipeline):
     out.append("")
 
     if pipeline["deals"]:
-        out.append("| 案件名 | 会社 | 金額 | 予定クローズ日 | ステージ |")
+        out.append("| 案件名 | 会社 | 金額 | 納品予定日 | ステージ |")
         out.append("|---|---|---|---|---|")
         for d in sorted(pipeline["deals"], key=lambda x: x["amount"], reverse=True):
-            close_short = "-"
-            if d.get("closedate"):
+            delivery_short = "-"
+            if d.get("delivery_date"):
                 try:
-                    close_short = datetime.fromisoformat(
-                        d["closedate"].replace("Z", "+00:00")
+                    delivery_short = datetime.fromisoformat(
+                        d["delivery_date"].replace("Z", "+00:00")
                     ).strftime("%Y/%m/%d")
                 except (ValueError, TypeError):
-                    close_short = d["closedate"]
+                    delivery_short = d["delivery_date"]
             out.append(
                 f"| {d['name']} | {d['company']} | ¥{d['amount']:,.0f}"
-                f" | {close_short} | {d['stage']} |"
+                f" | {delivery_short} | {d['stage']} |"
             )
         out.append("")
     else:
@@ -1292,12 +1314,13 @@ def generate_quarterly_report(per_quarter, overall_results, owner_name):
     def add(text=""):
         lines.append(text)
 
-    add("# HubSpot 営業実績分析レポート（四半期別）")
+    add("# HubSpot 営業実績分析レポート（四半期別・納品日ベース）")
     add()
     add("## 概要")
     add()
     add(f"- **対象**: {owner_name}")
     add(f"- **期間**: {FISCAL_RANGE_START.strftime('%Y/%m/%d')} 〜 {FISCAL_RANGE_END.strftime('%Y/%m/%d')}")
+    add(f"- **基準日**: 納品日（HubSpotカスタムプロパティ `started_day`、未設定時は closedate にフォールバック）")
     add(f"- **生成日**: {now.strftime('%Y/%m/%d %H:%M')}")
     add()
 
@@ -1319,8 +1342,9 @@ def generate_quarterly_report(per_quarter, overall_results, owner_name):
             add(_quarter_summary_row(label, status_label, entry["results"]))
     add()
     add(
-        "*注: 取引数・成約系列は createdate または closedate が当該四半期内の取引を計上しています。"
-        "四半期をまたぐ案件は複数四半期に計上される場合があります。未来四半期は closedate 予定のオープン案件のみ表示しています。*"
+        "*注: 取引は **納品日(started_day)** が当該四半期内のものを計上しています"
+        "（納品日未設定時は closedate にフォールバック）。"
+        "未来四半期は 納品予定日が該当期間のオープン案件のみ表示しています。*"
     )
     add()
 
@@ -1445,10 +1469,14 @@ def main():
         deal_activities = fetch_deal_activities(client, deal_ids)
 
     print("データを分析中...")
-    analysis = analyze_data(deals, stage_map, deal_companies, deal_activities)
+    monthly_date_field = "started_day" if args.fiscal_quarters else "closedate"
+    analysis = analyze_data(
+        deals, stage_map, deal_companies, deal_activities,
+        monthly_date_field=monthly_date_field,
+    )
 
     if args.fiscal_quarters:
-        print("四半期別レポートを生成中...")
+        print("四半期別レポートを生成中(納品日ベース)...")
         now = datetime.now()
         per_quarter = []
         for label, q_start, q_end in FISCAL_QUARTERS:
@@ -1464,7 +1492,10 @@ def main():
                 print(f"  {label}: 未来四半期 — 予定パイプライン {pipeline['count']}件 / ¥{pipeline['amount']:,.0f}")
             else:
                 subset = filter_deals_for_quarter(deals, q_start, q_end)
-                q_results = analyze_data(subset, stage_map, deal_companies, deal_activities)
+                q_results = analyze_data(
+                    subset, stage_map, deal_companies, deal_activities,
+                    monthly_date_field="started_day",
+                )
                 kind = "current" if q_end >= now else "past"
                 per_quarter.append({
                     "label": label,

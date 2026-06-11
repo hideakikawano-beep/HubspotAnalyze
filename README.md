@@ -53,6 +53,10 @@ python analyze.py --period 2025-01-01:2025-12-31
 # オーナー名を指定（デフォルト: Hideaki Kawano）
 python analyze.py --period all --owner "Hideaki Kawano"
 
+# 営業全員分を一括生成（個別レポート＋チームサマリー）
+# reports/team_report_YYYYMMDD_HHMMSS/ に営業ごとのレポートと team_summary.md を出力
+python analyze.py --period 2026-04-01:2026-06-30 --owner all
+
 # 出力先を指定
 python analyze.py --period all --output reports/custom_report.md
 ```

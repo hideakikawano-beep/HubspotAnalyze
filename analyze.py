@@ -255,7 +255,7 @@ def parse_args():
     parser.add_argument(
         "--owner",
         default="Hideaki Kawano",
-        help="対象オーナー名 (部分一致)",
+        help="対象オーナー名 (部分一致)。'all' で全オーナー分を一括生成",
     )
     parser.add_argument(
         "--output",
@@ -302,6 +302,15 @@ def get_date_range(period_str):
     return start_date, end_date
 
 
+def get_owner_map(client):
+    """全オーナーの {owner_id: 表示名} マップを返す"""
+    owner_map = {}
+    for owner in client.crm.owners.get_all():
+        full_name = f"{owner.first_name or ''} {owner.last_name or ''}".strip()
+        owner_map[str(owner.id)] = full_name or owner.email or f"ID:{owner.id}"
+    return owner_map
+
+
 def find_owner(client, owner_name):
     """オーナー名で検索してowner_idを返す"""
     owners_list = client.crm.owners.get_all()
@@ -345,14 +354,24 @@ def _search_deals(client, filter_groups, after=None):
 
 def fetch_deals(client, owner_id, start_date, end_date, date_field="both"):
     """取引を検索して取得
+    owner_id: Noneならオーナーフィルタなし（全オーナー分を取得）
     date_field: 'createdate', 'closedate', or 'both'
     'both' = 作成日が期間内 OR 成約/失注日が期間内 の両方を取得（重複排除）
     """
-    owner_filter = Filter(property_name="hubspot_owner_id", operator="EQ", value=owner_id)
+    base_filters = []
+    if owner_id is not None:
+        base_filters.append(
+            Filter(property_name="hubspot_owner_id", operator="EQ", value=owner_id)
+        )
 
     if not start_date:
         # 全期間の場合
-        results = _search_deals(client, [FilterGroup(filters=[owner_filter])])
+        if not base_filters:
+            # フィルタなしはSearch API非対応のため、createdateで全期間を指定
+            base_filters.append(
+                Filter(property_name="createdate", operator="GTE", value="0")
+            )
+        results = _search_deals(client, [FilterGroup(filters=base_filters)])
         print(f"取引数: {len(results)}件を取得")
         return results
 
@@ -361,14 +380,12 @@ def fetch_deals(client, owner_id, start_date, end_date, date_field="both"):
 
     if date_field == "both":
         # 作成日ベースで検索
-        create_filters = [
-            owner_filter,
+        create_filters = base_filters + [
             Filter(property_name="createdate", operator="GTE", value=start_ms),
             Filter(property_name="createdate", operator="LTE", value=end_ms),
         ]
         # 成約/失注日ベースで検索
-        close_filters = [
-            owner_filter,
+        close_filters = base_filters + [
             Filter(property_name="closedate", operator="GTE", value=start_ms),
             Filter(property_name="closedate", operator="LTE", value=end_ms),
         ]
@@ -389,8 +406,7 @@ def fetch_deals(client, owner_id, start_date, end_date, date_field="both"):
         print(f"取引数: {len(all_deals)}件を取得（重複排除後）")
         return all_deals
     else:
-        filters = [
-            owner_filter,
+        filters = base_filters + [
             Filter(property_name=date_field, operator="GTE", value=start_ms),
             Filter(property_name=date_field, operator="LTE", value=end_ms),
         ]
@@ -699,6 +715,83 @@ def analyze_data(deals, stage_map, deal_companies, deal_activities):
             )
 
     return results
+
+
+def generate_team_summary(rows, period_str, start_date, end_date):
+    """全オーナーの比較サマリーレポートを生成
+    rows: [(owner_name, analysis_results, report_filename), ...]
+    """
+    now = datetime.now()
+    lines = []
+
+    def add(text=""):
+        lines.append(text)
+
+    add("# HubSpot 営業実績チームサマリー")
+    add()
+    add("## 分析概要")
+    add()
+    add(f"- **対象**: 営業全員（{len(rows)}名）")
+    if start_date and end_date:
+        add(f"- **期間**: {start_date.strftime('%Y/%m/%d')} - {end_date.strftime('%Y/%m/%d')}")
+    else:
+        add("- **期間**: 全期間")
+    add(f"- **生成日**: {now.strftime('%Y/%m/%d %H:%M')}")
+    add()
+    add("---")
+    add()
+
+    # チーム合計
+    team_total = sum(r["total"] for _, r, _ in rows)
+    team_won = sum(len(r["won"]) for _, r, _ in rows)
+    team_lost = sum(len(r["lost"]) for _, r, _ in rows)
+    team_open = sum(len(r["open"]) for _, r, _ in rows)
+    team_won_amount = sum(sum(r["won_amounts"]) for _, r, _ in rows)
+    team_open_amount = sum(sum(r["open_amounts"]) for _, r, _ in rows)
+    team_decided = team_won + team_lost
+    team_win_rate = (team_won / team_decided * 100) if team_decided > 0 else 0
+
+    add("## チーム合計")
+    add()
+    add("| 指標 | 値 |")
+    add("|---|---|")
+    add(f"| 取引数 | {team_total}件 |")
+    add(f"| 成約数 | {team_won}件 |")
+    add(f"| 成約合計金額 | ¥{team_won_amount:,.0f} |")
+    add(f"| 成約率（成約/決着済） | {team_win_rate:.1f}%（{team_won}/{team_decided}件） |")
+    add(f"| 失注数 | {team_lost}件 |")
+    add(f"| 進行中 | {team_open}件（¥{team_open_amount:,.0f}） |")
+    add()
+
+    # 営業別比較（成約金額の降順）
+    add("## 営業別比較")
+    add()
+    add("| 営業 | 取引数 | 成約数 | 成約金額 | 成約率 | 失注数 | 進行中 | 進行中金額 | 平均リードタイム | 詳細 |")
+    add("|---|---|---|---|---|---|---|---|---|---|")
+
+    def sort_key(row):
+        _, r, _ = row
+        return sum(r["won_amounts"])
+
+    for name, r, filename in sorted(rows, key=sort_key, reverse=True):
+        won = len(r["won"])
+        lost = len(r["lost"])
+        open_cnt = len(r["open"])
+        decided = won + lost
+        win_rate = (won / decided * 100) if decided > 0 else 0
+        won_amount = sum(r["won_amounts"])
+        open_amount = sum(r["open_amounts"])
+        avg_lead = (sum(r["lead_times"]) / len(r["lead_times"])) if r["lead_times"] else 0
+        add(
+            f"| {name} | {r['total']}件 | {won}件 | ¥{won_amount:,.0f} "
+            f"| {win_rate:.1f}% | {lost}件 | {open_cnt}件 | ¥{open_amount:,.0f} "
+            f"| {avg_lead:.1f}日 | [{filename}]({filename}) |"
+        )
+    add()
+    add("※ 成約率は決着済（成約+失注）に対する成約の割合。各営業の詳細は個別レポートを参照。")
+    add()
+
+    return "\n".join(lines)
 
 
 def generate_report(results, owner_name, period_str, start_date, end_date):
@@ -1037,7 +1130,14 @@ def main():
     print("HubSpot に接続中...")
     client = HubSpot(access_token=api_key)
 
-    owner_id, owner_name = find_owner(client, args.owner)
+    all_mode = args.owner.strip().lower() in ("all", "*") or args.owner.strip() == "全員"
+    if all_mode:
+        owner_map = get_owner_map(client)
+        owner_id = None
+        owner_name = "営業全員"
+        print(f"対象: 営業全員（オーナー{len(owner_map)}名）")
+    else:
+        owner_id, owner_name = find_owner(client, args.owner)
 
     start_date, end_date = get_date_range(args.period)
     if start_date:
@@ -1084,6 +1184,40 @@ def main():
     else:
         print("アクティビティデータを取得中...")
         deal_activities = fetch_deal_activities(client, deal_ids)
+
+    if all_mode:
+        # オーナー別にグルーピングして個別レポート＋チームサマリーを生成
+        deals_by_owner = defaultdict(list)
+        for deal in deals:
+            oid = str(deal.properties.get("hubspot_owner_id") or "")
+            deals_by_owner[oid].append(deal)
+
+        out_dir = args.output or f"reports/team_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(out_dir, exist_ok=True)
+
+        summary_rows = []
+        for oid, owner_deals in sorted(deals_by_owner.items(), key=lambda kv: -len(kv[1])):
+            if oid:
+                name = owner_map.get(oid, f"不明オーナー({oid})")
+            else:
+                name = "未割り当て"
+            print(f"\n=== {name}: {len(owner_deals)}件を分析中 ===")
+            analysis = analyze_data(owner_deals, stage_map, deal_companies, deal_activities)
+            report = generate_report(analysis, name, args.period, start_date, end_date)
+            slug = re.sub(r"[^\w]+", "_", name).strip("_") or oid or "unassigned"
+            report_path = os.path.join(out_dir, f"sales_report_{slug}.md")
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(report)
+            print(f"  → {report_path}")
+            summary_rows.append((name, analysis, os.path.basename(report_path)))
+
+        summary = generate_team_summary(summary_rows, args.period, start_date, end_date)
+        summary_path = os.path.join(out_dir, "team_summary.md")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(summary)
+        print(f"\nチームサマリーを保存しました: {summary_path}")
+        print("完了!")
+        return
 
     print("データを分析中...")
     analysis = analyze_data(deals, stage_map, deal_companies, deal_activities)

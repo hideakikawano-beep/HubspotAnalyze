@@ -1,6 +1,6 @@
 .env
 __pycache__/
 *.pyc
-reports/*.md
+reports/*
 !reports/.gitkeep
 .venv/

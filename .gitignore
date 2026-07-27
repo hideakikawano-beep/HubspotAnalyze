@@ -4,3 +4,5 @@ __pycache__/
 reports/*.md
 !reports/.gitkeep
 .venv/
+mf_attendance/storage_state.json
+mf_attendance/logs/
